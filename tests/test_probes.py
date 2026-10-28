@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import errno
 import shutil
+import types
 
 import pytest
 
@@ -82,6 +83,117 @@ def test_memory_memory_error_is_blocked():
     assert why == "MemoryError"
 
 
+# --- outcomes (no Docker needed) -------------------------------------------
+
+
+def fake_run_script(monkeypatch, payload, *, error=None):
+    """Feed a probe a canned sandbox result instead of starting a container."""
+    result = types.SimpleNamespace(
+        error=error, exit_code=1, stderr="boom", isolation="runc", oom_killed=False
+    )
+    monkeypatch.setattr(
+        probes, "_run_script", lambda script, limits: (result, payload)
+    )
+
+
+def test_a_probe_that_could_not_run_is_unproven_not_allowed(monkeypatch):
+    """Measured 2026-10-28: a deleted probe source made the panel say ALLOWED."""
+    fake_run_script(monkeypatch, None, error="could not copy the source tree: [Errno 2]")
+
+    result = probes.probe_network_egress()
+
+    assert result.outcome == probes.UNPROVEN
+    assert result.blocked is False
+    assert "sandbox error" in result.evidence
+    assert result.as_dict()["outcome"] == "unproven"
+
+
+def test_an_observed_escape_is_allowed(monkeypatch):
+    fake_run_script(
+        monkeypatch,
+        {
+            "attempts": [
+                {"target": "tcp 1.1.1.1:443", "outcome": "connected"},
+                {"target": "dns example.com", "outcome": "resolved"},
+            ]
+        },
+    )
+
+    result = probes.probe_network_egress()
+
+    assert result.outcome == probes.ALLOWED
+    assert result.blocked is False
+
+
+def test_a_refused_escape_is_blocked(monkeypatch):
+    fake_run_script(
+        monkeypatch,
+        {
+            "attempts": [
+                {"target": "tcp 1.1.1.1:443", "outcome": "failed", "error": "OSError"},
+            ]
+        },
+    )
+
+    result = probes.probe_network_egress()
+
+    assert result.outcome == probes.BLOCKED
+    assert result.blocked is True
+
+
+def test_a_fork_bomb_that_reached_the_cap_without_eagain_is_allowed(monkeypatch):
+    """Past half the cap and not stopped by it: the limit is not holding."""
+    fake_run_script(
+        monkeypatch,
+        {
+            "attempts": 400,
+            "children": 400,
+            "failure": "OSError: [Errno 12] Cannot allocate memory",
+            "failure_errno": errno.ENOMEM,
+        },
+    )
+
+    result = probes.probe_fork_bomb()
+
+    assert result.outcome == probes.ALLOWED
+
+
+def test_eagain_below_the_threshold_stays_unproven(monkeypatch):
+    fake_run_script(
+        monkeypatch,
+        {
+            "attempts": 11,
+            "children": 10,
+            "failure": "BlockingIOError: [Errno 11] Resource temporarily unavailable",
+            "failure_errno": errno.EAGAIN,
+        },
+    )
+
+    result = probes.probe_fork_bomb()
+
+    assert result.outcome == probes.UNPROVEN
+
+
+def test_the_env_leak_outcome_follows_the_fake_secret(monkeypatch):
+    fake_run_script(
+        monkeypatch,
+        {
+            "env_count": 3,
+            "keys": ["A"],
+            "suspects": [probes.FAKE_SECRET_ENV],
+            "empty_keys": [],
+            "fake_seen": [probes.FAKE_SECRET_ENV],
+        },
+    )
+
+    assert probes.probe_env_leak().outcome == probes.ALLOWED
+
+
+def test_an_unknown_outcome_is_refused():
+    with pytest.raises(ValueError):
+        probes.ProbeResult("probe", True, "probably-fine", "no evidence")
+
+
 # --- script templates (no Docker needed) -----------------------------------
 
 
@@ -116,13 +228,16 @@ def test_the_runner_blanks_image_metadata():
 def test_every_probe_ran(results):
     assert [r.name for r in results] == EXPECTED_NAMES
     assert all(r.attempted for r in results)
+    assert {r.outcome for r in results} <= set(probes.OUTCOMES)
 
 
 @pytest.mark.docker
 def test_every_probe_is_blocked(results):
-    escaped = [r.name for r in results if not r.blocked]
-    assert not escaped, "probes escaped containment: " + ", ".join(
-        f"{r.name} ({r.evidence})" for r in results if not r.blocked
+    escaped = [r.name for r in results if r.outcome != probes.BLOCKED]
+    assert not escaped, "probes did not prove containment: " + ", ".join(
+        f"{r.name} ({r.outcome}: {r.evidence})"
+        for r in results
+        if r.outcome != probes.BLOCKED
     )
 
 

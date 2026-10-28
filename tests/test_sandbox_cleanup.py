@@ -9,12 +9,12 @@ from __future__ import annotations
 
 import shutil
 import subprocess
-import tempfile
 from pathlib import Path
 
 import pytest
 
 from ega import sandbox
+from ega import tmp
 from ega.sandbox import Limits
 
 
@@ -54,7 +54,7 @@ def make_src(tmp_path: Path) -> Path:
 
 
 def temp_dirs() -> set[str]:
-    return {p.name for p in Path(tempfile.gettempdir()).glob("ega-work-*")}
+    return {p.name for p in tmp.root().glob("ega-work-*")}
 
 
 def test_a_failed_output_copy_still_deletes_the_mount_dir(tmp_path, fake_docker, monkeypatch):

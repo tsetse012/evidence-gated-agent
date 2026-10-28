@@ -25,11 +25,12 @@ import os
 import shutil
 import stat
 import subprocess
-import tempfile
 import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
+
+from . import tmp
 
 DEFAULT_IMAGE = "ega-sandbox:dev"
 
@@ -405,7 +406,7 @@ def run(
     duration = 0.0
 
     started = time.monotonic()
-    work_root = Path(tempfile.mkdtemp(prefix="ega-work-"))
+    work_root = tmp.mkdtemp("ega-work-")
     work = work_root / "work"
     try:
         try:
@@ -478,7 +479,7 @@ def run(
                 target = (
                     after_dir
                     if after_dir is not None
-                    else Path(tempfile.mkdtemp(prefix="ega-after-"))
+                    else tmp.mkdtemp("ega-after-")
                 )
                 # Recorded before anything can fail: a failed copy must not
                 # leave this directory behind with no reference to remove it.

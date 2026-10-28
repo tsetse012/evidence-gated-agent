@@ -54,7 +54,6 @@ import itertools
 import os
 import re
 import shutil
-import tempfile
 import time
 import tokenize
 import tomllib
@@ -64,6 +63,7 @@ from pathlib import Path
 from typing import Sequence
 
 from . import sandbox
+from . import tmp
 from .evidence import (
     CRITICAL,
     HIGH,
@@ -311,7 +311,7 @@ def stage_repo(source: Path) -> Path:
     staged the same way here. That is the *only* filtering the comparison gets
     — the diff itself ignores nothing but ``_RUN_BYPRODUCTS``.
     """
-    target = Path(tempfile.mkdtemp(prefix="ega-base-"))
+    target = tmp.mkdtemp("ega-base-")
     try:
         shutil.copytree(
             source,
@@ -910,7 +910,7 @@ def verify(
 
         # The report of the pristine run lands in the same verifier-owned
         # directory as the snapshot's, so it must exist before that run.
-        out_root = Path(tempfile.mkdtemp(prefix="ega-out-"))
+        out_root = tmp.mkdtemp("ega-out-")
 
         if baseline_repo is not None:
             baseline = collect_baseline(baseline_repo, out_root, limits, run_id)

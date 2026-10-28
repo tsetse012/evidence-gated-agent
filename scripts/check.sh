@@ -10,11 +10,16 @@ set -uo pipefail
 cd "$(dirname "$0")/.."
 mkdir -p runs
 
-# Temp-dir leak check: a verifier run owns every ega-* directory it creates, so
-# the number of them in TMPDIR must not grow across the whole suite.
-tmp_root="${TMPDIR:-/tmp}"
-ega_tmp_before=runs/ega-tmp-before.txt
-find "${tmp_root}" -maxdepth 1 -name 'ega-*' -print | sort > "${ega_tmp_before}"
+# Temp-dir leak check: every temporary directory the harness creates lives under
+# one root owned by the process that made it (ega/tmp.py). This gate hands the
+# suite its own EGA_TMPDIR, so the check has a scope it owns end to end — and so
+# a demo server running on :8765 at the same time keeps its own directories.
+# The old check globbed the whole of TMPDIR, which meant one process's cleanup
+# deleted the other's live files and both read as failures.
+check_tmp_parent="$(mktemp -d "${TMPDIR:-/tmp}/ega-check-XXXXXX")"
+export EGA_TMPDIR="${check_tmp_parent}"
+trap 'rm -rf "${check_tmp_parent}"' EXIT
+echo "temp root for this run: ${check_tmp_parent} (EGA_TMPDIR)"
 
 echo "== [1/4] build sandbox image =="
 if ! bash scripts/build_image.sh; then
@@ -70,19 +75,18 @@ fi
 
 echo
 echo "== temp dir leak check =="
-ega_tmp_after=runs/ega-tmp-after.txt
-find "${tmp_root}" -maxdepth 1 -name 'ega-*' -print | sort > "${ega_tmp_after}"
-leaked=$(comm -13 "${ega_tmp_before}" "${ega_tmp_after}")
-before_count=$(wc -l < "${ega_tmp_before}" | tr -d ' ')
-after_count=$(wc -l < "${ega_tmp_after}" | tr -d ' ')
-echo "ega-* under ${tmp_root}: before=${before_count} after=${after_count}"
+# A clean process removes its own (empty) root on exit, so anything left here is
+# a directory some run failed to clean: report the files, not just the count.
+leaked="$(find "${check_tmp_parent}" -mindepth 1 -maxdepth 3 -print 2>/dev/null | sort)"
+echo "leftovers under ${check_tmp_parent}: $(printf '%s' "${leaked}" | grep -c . || true)"
 if [ -n "${leaked}" ]; then
-  echo "FAIL: the run leaked ega-* temp directories:"
+  echo "FAIL: the run leaked temp directories under ${check_tmp_parent}:"
   echo "${leaked}" | head -n 20
   [ "${gate_status}" -eq 0 ] && gate_status=1
 else
-  echo "OK: no ega-* temp directories leaked"
+  echo "OK: no temp directories leaked"
 fi
+rm -rf "${check_tmp_parent}"
 
 echo
 echo "== last 40 lines of the full log =="

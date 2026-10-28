@@ -40,6 +40,7 @@
            border: 1px solid var(--line); font-size: 12px; }
   .badge.blocked { color: var(--green); border-color: var(--green); }
   .badge.allowed { color: var(--red); border-color: var(--red); }
+  .badge.unproven { color: var(--amber); border-color: var(--amber); }
   .badge.critical { color: var(--red); border-color: var(--red); }
   .badge.high { color: var(--amber); border-color: var(--amber); }
   .badge.medium, .badge.warning { color: var(--muted); }
@@ -104,10 +105,17 @@
 const $ = (id) => document.getElementById(id);
 let fixtures = [];
 let currentRun = null;
+let currentSummary = null;
 let pollTimer = null;
 
 const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 const tokenClass = (t) => (t === "done" ? "done" : t === "partial" ? "warn" : t ? "bad" : "muted");
+
+// A probe that could not observe anything (sandbox error, no result) proves
+// neither containment nor an escape: it is NOT PROVEN, never "allowed".
+const OUTCOME_LABELS = { blocked: "blocked", allowed: "ALLOWED", unproven: "NOT PROVEN" };
+const probeOutcome = (p) => (p.outcome in OUTCOME_LABELS ? p.outcome : "unproven");
+const probeLabel = (p) => OUTCOME_LABELS[probeOutcome(p)];
 
 async function loadFixtures() {
   const res = await fetch("/api/fixtures");
@@ -124,6 +132,9 @@ function renderPatches() {
 async function startRun() {
   $("run").disabled = true;
   $("status-line").textContent = "starting…";
+  currentSummary = null;
+  $("approve-reason").value = "";
+  updateApproveState();
   const body = { fixture: $("fixture").value, author: "scripted:" + $("patch").value };
   const res = await fetch("/api/runs", {
     method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
@@ -188,7 +199,7 @@ function render(data) {
     ? `<table><tr><th>probe</th><th>result</th><th>evidence</th></tr>` +
       probes.map((p) => `<tr>
         <td>${esc(p.name)}</td>
-        <td><span class="badge ${p.blocked ? "blocked" : "allowed"}">${p.blocked ? "blocked" : "ALLOWED"}</span></td>
+        <td><span class="badge ${probeOutcome(p)}">${probeLabel(p)}</span></td>
         <td class="evidence">${esc(p.evidence)}</td></tr>`).join("") + `</table>`
     : `<span class="muted">not run yet</span>`;
 
@@ -197,17 +208,37 @@ function render(data) {
      <span class="muted">${esc(st.status)}${st.exit_code === null ? "" : " exit=" + st.exit_code}</span>
      <span class="muted">${esc(st.ts || "")}</span></li>`).join("");
 
+  currentSummary = s;
+  updateApproveState();
+}
+
+// Approval gating, mirrored from the server: `done` is approved as-is,
+// `partial` needs a written reason (the button stays disabled until there is
+// one, and the API answers 409 in any case), everything else is never
+// approvable. A new run clears the reason box so a stale reason cannot enable
+// the button for a verdict it was not written for.
+function updateApproveState() {
+  const s = currentSummary || {};
+  const token = (s.verdict || {}).exit_token;
   const approved = !!s.approved;
-  const partial = v.exit_token === "partial";
-  $("approve").disabled = !(v.exit_token === "done" || partial) || approved;
+  const partial = token === "partial";
+  const reason = $("approve-reason").value.trim();
+  const enabled = !approved && (token === "done" || (partial && reason.length > 0));
+  $("approve").disabled = !enabled;
   $("approve-reason").disabled = !partial || approved;
-  $("approve-note").textContent = approved
-    ? `approved at ${s.approved_at} — recorded in the trace (no external side effect in this phase)`
-    : (v.exit_token === "done"
-        ? "verdict is done — approval allowed"
-        : partial
-          ? "verdict is partial — a written reason is required and is recorded in the trace"
-          : "approval is enabled for done, and for partial with a written reason");
+  if (approved) {
+    $("approve-note").textContent = `approved at ${s.approved_at} — recorded in the trace (no external side effect in this phase)`;
+  } else if (token === "done") {
+    $("approve-note").textContent = "verdict is done — approval allowed";
+  } else if (partial) {
+    $("approve-note").textContent = reason
+      ? "verdict is partial — the reason is recorded in the trace together with the findings it overrides"
+      : "verdict is partial — a written reason is required before approval is enabled";
+  } else if (token) {
+    $("approve-note").textContent = `verdict is ${token} — not approvable`;
+  } else {
+    $("approve-note").textContent = "approval is enabled for done, and for partial with a written reason";
+  }
 }
 
 async function approve() {
@@ -226,6 +257,7 @@ async function approve() {
 $("fixture").addEventListener("change", renderPatches);
 $("run").addEventListener("click", startRun);
 $("approve").addEventListener("click", approve);
+$("approve-reason").addEventListener("input", updateApproveState);
 loadFixtures();
 </script>
 </body>

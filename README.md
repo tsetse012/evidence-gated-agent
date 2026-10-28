@@ -108,8 +108,11 @@ and exits non-zero if anything was collected zero, failed, or if
 docker-marked tests were skipped while Docker is available. It also unsets
 `PYTEST_ADDOPTS` for every pytest call and compares the junit node ids against
 the required list in `scripts/expected_tests.txt` — counting alone cannot tell
-a full run from a filtered one. Our own tests are held to the same "no false
-green" rule as the agents we judge.
+a full run from a filtered one. Temp-directory cleanup is scoped to the
+process root the run owns (`EGA_TMPDIR`, see `ega/tmp.py`), so this gate may run
+while a demo server is up on the same machine — neither deletes the other's
+work. Our own tests are held to the same "no false green" rule as the agents we
+judge.
 
 Without Docker the gate **fails** (`CHECK FAILED`); `EGA_ALLOW_NO_DOCKER=1`
 downgrades it to exit 3 and prints `DEGRADED`, and only skips carrying the
@@ -257,7 +260,8 @@ Known limits, stated rather than hidden:
 | path | what |
 | --- | --- |
 | `ega/sandbox.py` | one fresh container per run; all limits mandatory |
-| `ega/probes.py` | six containment probes, `blocked` decided from evidence |
+| `ega/probes.py` | six containment probes; each attempt classified `blocked` / `allowed` / `unproven` from evidence |
+| `ega/tmp.py` | one temp root per process — two processes never sweep each other's files |
 | `ega/evidence.py` | false-green detectors over junit XML + stdout + exit code |
 | `ega/verify.py` | independent verifier: snapshot + claim in, verdict out |
 | `ega/trace.py` | append-only JSONL; `summary.json` derived from it |
@@ -295,7 +299,11 @@ choice is recorded as `isolation` in every result. `EGA_RUNTIME` overrides it.
 The six probes (`network_egress`, `host_secret_read`, `write_outside_workspace`,
 `fork_bomb`, `memory_hog`, `env_leak`) each *attempt* the escape inside the
 sandbox and report the observed failure — exception text, exit code,
-`OOMKilled` — never an assumption. `env_leak` seeds `EGA_FAKE_SECRET_TOKEN` in
+`OOMKilled` — never an assumption. Each result is classified `blocked` (the
+evidence proves containment held), `allowed` (the evidence proves an escape) or
+**`unproven`** (sandbox error, no result, or a failure that is not the limit
+under test). `unproven` is never rendered as "allowed": a probe that could not
+run says nothing about containment. `env_leak` seeds `EGA_FAKE_SECRET_TOKEN` in
 the host environment first, to prove it does not pass through.
 
 ## What existed before kickoff (2026-11-03 16:00 UTC)
@@ -306,7 +314,8 @@ are **no LLM calls, no prompts, no inference client**: the author is
 
 1. `ega/sandbox.py` — Docker-CLI isolated runner (limits above, timeout kill,
    OOM inspection, `workdir_after` snapshot, copy/ownership boundaries).
-2. `ega/probes.py` — the six containment probes.
+2. `ega/probes.py` + `ega/tmp.py` — the six containment probes (outcome
+   `blocked`/`allowed`/`unproven`), and the per-process temp root they run in.
 3. `ega/evidence.py` — the twelve false-green detectors and the closed
    verdict-token mapping.
 4. `ega/verify.py` — the independent verifier pipeline: fixed pytest command,

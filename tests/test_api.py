@@ -19,6 +19,29 @@ def test_index_serves_the_static_page():
     assert "Evidence-Gated Agent" in response.text
 
 
+def test_the_probe_panel_has_a_not_proven_state():
+    """A probe that could not observe anything must not read as ALLOWED.
+
+    The page is checked as text: the gate has no JS engine, and shipping one to
+    run three assertions would cost more than it proves. The behaviour itself is
+    unit-tested against ``ProbeResult.outcome`` in ``test_probes.py``.
+    """
+    page = client.get("/").text
+
+    assert 'unproven: "NOT PROVEN"' in page
+    assert 'const probeOutcome = (p) => (p.outcome in OUTCOME_LABELS ? p.outcome : "unproven")' in page
+
+
+def test_the_approve_button_needs_a_reason_for_a_partial_verdict():
+    page = client.get("/").text
+
+    # done → enabled; partial → enabled only once the reason box is non-empty;
+    # anything else never. The server keeps refusing a reasonless partial (409).
+    assert 'const enabled = !approved && (token === "done" || (partial && reason.length > 0))' in page
+    assert '$("approve").disabled = !enabled' in page
+    assert 'addEventListener("input", updateApproveState)' in page
+
+
 def test_fixtures_endpoint_lists_the_demo_targets():
     response = client.get("/api/fixtures")
     assert response.status_code == 200

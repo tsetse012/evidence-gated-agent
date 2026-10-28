@@ -9,12 +9,12 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
-import tempfile
 import textwrap
 from pathlib import Path
 
 import pytest
 
+from ega import tmp
 from ega.sandbox import Limits, run
 
 CANARY = "HOST-ONLY-SECRET-4d1f"
@@ -22,11 +22,16 @@ CANARY = "HOST-ONLY-SECRET-4d1f"
 
 @pytest.fixture(autouse=True)
 def _no_temp_leaks():
-    """Sandbox runs may leave an ega-after-* copy; never leave it behind here."""
-    before = set(Path(tempfile.gettempdir()).glob("ega-*"))
+    """Sandbox runs may leave an ega-after-* copy; never leave it behind here.
+
+    Only this process's own root is swept. A glob of the whole tempdir would
+    delete a demo server's live probe source on the same machine — measured
+    2026-10-28, three probes then reported "could not copy the source tree".
+    """
+    root = tmp.root()
+    before = set(root.iterdir()) if root.is_dir() else set()
     yield
-    for path in set(Path(tempfile.gettempdir()).glob("ega-*")) - before:
-        shutil.rmtree(path, ignore_errors=True)
+    tmp.sweep(root, before)
 
 
 def make_src(tmp_path: Path, files: dict[str, str] | None = None) -> Path:
@@ -95,7 +100,7 @@ def test_a_symlink_written_by_the_container_is_not_followed_out(tmp_path):
 @pytest.mark.docker
 def test_container_can_write_into_a_0700_source_tree():
     """A mkdtemp() 0700 tree must be writable by uid 1000 (ownership boundary)."""
-    root = Path(tempfile.mkdtemp(prefix="ega-0700-"))
+    root = tmp.mkdtemp("ega-0700-")
     try:
         src = root / "src"
         src.mkdir()

@@ -10,11 +10,10 @@ import errno
 import json
 import os
 import shutil
-import tempfile
 from dataclasses import dataclass
-from pathlib import Path
 
 from . import sandbox
+from . import tmp
 from .sandbox import Limits, SandboxResult
 
 FAKE_SECRET_ENV = "EGA_FAKE_SECRET_TOKEN"
@@ -30,21 +29,54 @@ PROBE_LIMITS = Limits(memory="256m", cpus=1.0, pids_limit=128, timeout_s=90)
 
 RESULT_PREFIX = "EGA_RESULT "
 
+# Three outcomes, decided from evidence only:
+#   blocked  — the probe tried to escape and what it observed proves it failed
+#   allowed  — the probe tried to escape and what it observed proves it got out
+#   unproven — nothing was observed that settles it (sandbox error, no result,
+#              a failure that is not the limit under test)
+# "unproven" must never be shown as "allowed": a probe that could not run says
+# nothing about containment.
+BLOCKED = "blocked"
+ALLOWED = "allowed"
+UNPROVEN = "unproven"
+OUTCOMES = (BLOCKED, ALLOWED, UNPROVEN)
+
 
 @dataclass
 class ProbeResult:
     name: str
     attempted: bool
-    blocked: bool
+    outcome: str
     evidence: str
+
+    def __post_init__(self) -> None:
+        if self.outcome not in OUTCOMES:
+            raise ValueError(f"unknown probe outcome {self.outcome!r}")
+
+    @property
+    def blocked(self) -> bool:
+        """True only when the evidence proves containment held."""
+        return self.outcome == BLOCKED
 
     def as_dict(self) -> dict:
         return {
             "name": self.name,
             "attempted": self.attempted,
             "blocked": self.blocked,
+            "outcome": self.outcome,
             "evidence": self.evidence,
         }
+
+
+def _unproven(name: str, result: SandboxResult) -> ProbeResult:
+    """The probe could not be observed: neither containment nor an escape."""
+    return ProbeResult(
+        name,
+        True,
+        UNPROVEN,
+        f"sandbox error: {result.error or 'probe produced no result'} "
+        f"exit={result.exit_code} stderr={_tail(result.stderr)}",
+    )
 
 
 def _payload(result: SandboxResult) -> dict | None:
@@ -65,7 +97,7 @@ def _tail(text: str, limit: int = 240) -> str:
 
 def _run_script(script: str, limits: Limits) -> tuple[SandboxResult, dict | None]:
     """Run one probe script; neither the source nor the result tree outlives it."""
-    src = Path(tempfile.mkdtemp(prefix="ega-probe-"))
+    src = tmp.mkdtemp("ega-probe-")
     try:
         (src / "probe.py").write_text(script, encoding="utf-8")
         result = sandbox.run(["python", "-I", "/work/probe.py"], src, limits)
@@ -184,20 +216,15 @@ print("EGA_RESULT " + json.dumps({{"env_count": len(env), "keys": sorted(env),
 def probe_network_egress(limits: Limits = PROBE_LIMITS) -> ProbeResult:
     result, payload = _run_script(NETWORK_SCRIPT, limits)
     if result.error or payload is None:
-        return ProbeResult(
-            "network_egress", True, False,
-            f"sandbox error: {result.error or 'probe produced no result'} "
-            f"exit={result.exit_code} stderr={_tail(result.stderr)}",
-        )
+        return _unproven("network_egress", result)
     attempts = payload["attempts"]
     escaped = [a for a in attempts if a["outcome"] in ("connected", "resolved")]
-    blocked = not escaped
     detail = "; ".join(
         f"{a['target']} -> {a['outcome']}" + (f" ({a['error']})" if a.get("error") else "")
         for a in attempts
     )
     return ProbeResult(
-        "network_egress", True, blocked,
+        "network_egress", True, ALLOWED if escaped else BLOCKED,
         f"{detail} [exit={result.exit_code} isolation={result.isolation}]",
     )
 
@@ -205,11 +232,7 @@ def probe_network_egress(limits: Limits = PROBE_LIMITS) -> ProbeResult:
 def probe_host_secret_read(limits: Limits = PROBE_LIMITS) -> ProbeResult:
     result, payload = _run_script(SECRET_SCRIPT, limits)
     if result.error or payload is None:
-        return ProbeResult(
-            "host_secret_read", True, False,
-            f"sandbox error: {result.error or 'probe produced no result'} "
-            f"exit={result.exit_code} stderr={_tail(result.stderr)}",
-        )
+        return _unproven("host_secret_read", result)
     attempts = payload["attempts"]
     read = [a for a in attempts if a["outcome"] == "read"]
     detail = "; ".join(
@@ -217,7 +240,7 @@ def probe_host_secret_read(limits: Limits = PROBE_LIMITS) -> ProbeResult:
         for a in attempts
     )
     return ProbeResult(
-        "host_secret_read", True, not read,
+        "host_secret_read", True, ALLOWED if read else BLOCKED,
         f"{detail} [exit={result.exit_code}]",
     )
 
@@ -225,11 +248,7 @@ def probe_host_secret_read(limits: Limits = PROBE_LIMITS) -> ProbeResult:
 def probe_write_outside_workspace(limits: Limits = PROBE_LIMITS) -> ProbeResult:
     result, payload = _run_script(WRITE_SCRIPT, limits)
     if result.error or payload is None:
-        return ProbeResult(
-            "write_outside_workspace", True, False,
-            f"sandbox error: {result.error or 'probe produced no result'} "
-            f"exit={result.exit_code} stderr={_tail(result.stderr)}",
-        )
+        return _unproven("write_outside_workspace", result)
     attempts = payload["attempts"]
     written = [a for a in attempts if a["outcome"] == "written"]
     detail = "; ".join(
@@ -237,7 +256,7 @@ def probe_write_outside_workspace(limits: Limits = PROBE_LIMITS) -> ProbeResult:
         for a in attempts
     )
     return ProbeResult(
-        "write_outside_workspace", True, not written,
+        "write_outside_workspace", True, ALLOWED if written else BLOCKED,
         f"{detail} [exit={result.exit_code}]",
     )
 
@@ -291,11 +310,7 @@ def memory_verdict(
 def probe_fork_bomb(limits: Limits = PROBE_LIMITS) -> ProbeResult:
     result, payload = _run_script(FORK_SCRIPT, limits)
     if result.error or payload is None:
-        return ProbeResult(
-            "fork_bomb", True, False,
-            f"sandbox error: {result.error or 'probe produced no result'} "
-            f"exit={result.exit_code} stderr={_tail(result.stderr)}",
-        )
+        return _unproven("fork_bomb", result)
     children = payload["children"]
     failure = payload["failure"]
     blocked, reached, why = fork_verdict(
@@ -307,16 +322,16 @@ def probe_fork_bomb(limits: Limits = PROBE_LIMITS) -> ProbeResult:
         f"eagain={blocked or 'EAGAIN' in (failure or '')} failure={failure} "
         f"why={why} [exit={result.exit_code}]"
     )
-    return ProbeResult("fork_bomb", True, blocked, evidence)
+    # Reaching half the cap and dying some *other* way means the pids limit did
+    # not stop the bomb (allowed); never approaching it proves nothing.
+    outcome = BLOCKED if blocked else (ALLOWED if reached else UNPROVEN)
+    return ProbeResult("fork_bomb", True, outcome, evidence)
 
 
 def probe_memory_hog(limits: Limits = PROBE_LIMITS) -> ProbeResult:
     result, payload = _run_script(MEMORY_SCRIPT, limits)
     if result.error:
-        return ProbeResult(
-            "memory_hog", True, False,
-            f"sandbox error: {result.error} exit={result.exit_code} stderr={_tail(result.stderr)}",
-        )
+        return _unproven("memory_hog", result)
     memory_error = bool(payload and payload.get("error"))
     allocated = payload["allocated_mb"] if payload else "unknown"
     blocked, why = memory_verdict(result.oom_killed, memory_error, result.exit_code)
@@ -336,7 +351,11 @@ def probe_memory_hog(limits: Limits = PROBE_LIMITS) -> ProbeResult:
             f"exit_code={result.exit_code} oom_killed={result.oom_killed} "
             f"memory_error={memory_error}"
         )
-    return ProbeResult("memory_hog", True, blocked, f"{evidence} why={why}")
+    # An exit code alone (e.g. 137) is not proof the cap did the killing, so
+    # anything the verdict does not confirm stays unproven.
+    return ProbeResult(
+        "memory_hog", True, BLOCKED if blocked else UNPROVEN, f"{evidence} why={why}"
+    )
 
 
 def probe_env_leak(limits: Limits = PROBE_LIMITS) -> ProbeResult:
@@ -344,14 +363,11 @@ def probe_env_leak(limits: Limits = PROBE_LIMITS) -> ProbeResult:
         ENV_SCRIPT_TEMPLATE.format(fake=FAKE_SECRET_VALUE), limits
     )
     if result.error or payload is None:
-        return ProbeResult(
-            "env_leak", True, False,
-            f"sandbox error: {result.error or 'probe produced no result'} "
-            f"exit={result.exit_code} stderr={_tail(result.stderr)}",
-        )
+        return _unproven("env_leak", result)
     suspicious = payload["suspects"]
     return ProbeResult(
-        "env_leak", True, not (suspicious or payload["fake_seen"]),
+        "env_leak", True,
+        ALLOWED if (suspicious or payload["fake_seen"]) else BLOCKED,
         f"env_count={payload['env_count']} keys={payload['keys']} "
         f"suspicious_keys={suspicious} empty_keys={payload['empty_keys']} "
         f"fake_token_seen={payload['fake_seen']} "

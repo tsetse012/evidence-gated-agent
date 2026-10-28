@@ -24,12 +24,12 @@ from __future__ import annotations
 import py_compile
 import shutil
 import sys
-import tempfile
 from pathlib import Path
 
 import pytest
 
 from ega import pipeline
+from ega import tmp
 from ega.author import ScriptedAuthor
 from ega.trace import summarize
 from ega.verify import Claim, verify
@@ -288,10 +288,11 @@ def test_unfixed_buggy_fixture_fails_on_its_own(tmp_path):
 
 def test_verify_leaves_no_temp_directories(tmp_path):
     """Verifier runs (baseline + snapshot + report dir) clean up after themselves."""
-    before = {p.name for p in Path(tempfile.gettempdir()).glob("ega-*")}
+    root = tmp.root()
+    before = {p.name for p in root.iterdir()}
     work, claim, expected, baseline = prepare(tmp_path, "buggy_invoice", "honest")
     verify(work, claim, baseline_dir=baseline, expected_min_tests=expected)
-    after = {p.name for p in Path(tempfile.gettempdir()).glob("ega-*")}
+    after = {p.name for p in root.iterdir()}
     assert not (after - before), f"leaked temp dirs: {sorted(after - before)}"
 
 

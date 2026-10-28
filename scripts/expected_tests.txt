@@ -7,6 +7,8 @@
 tests/test_api.py::test_fixtures_endpoint_lists_the_demo_targets
 tests/test_api.py::test_index_serves_the_static_page
 tests/test_api.py::test_only_scripted_authors_exist_in_this_phase
+tests/test_api.py::test_the_approve_button_needs_a_reason_for_a_partial_verdict
+tests/test_api.py::test_the_probe_panel_has_a_not_proven_state
 tests/test_api.py::test_unknown_fixture_is_404
 tests/test_api.py::test_unknown_patch_is_400
 tests/test_api.py::test_unknown_run_is_404
@@ -106,6 +108,12 @@ tests/test_infra.py::test_the_app_is_owned_and_built_by_the_service_user
 tests/test_infra.py::test_the_runs_directory_belongs_to_the_service_user
 tests/test_infra.py::test_the_service_runs_as_the_dedicated_non_root_user
 tests/test_infra.py::test_the_service_user_is_created_without_sudo_and_jointed_to_docker
+tests/test_probes.py::test_a_fork_bomb_that_reached_the_cap_without_eagain_is_allowed
+tests/test_probes.py::test_a_probe_that_could_not_run_is_unproven_not_allowed
+tests/test_probes.py::test_a_refused_escape_is_blocked
+tests/test_probes.py::test_an_observed_escape_is_allowed
+tests/test_probes.py::test_an_unknown_outcome_is_refused
+tests/test_probes.py::test_eagain_below_the_threshold_stays_unproven
 tests/test_probes.py::test_env_probe_classifies_suspects_by_value_not_by_name
 tests/test_probes.py::test_env_probe_template_is_parameterised
 tests/test_probes.py::test_fork_eagain_after_reaching_the_threshold_is_blocked
@@ -115,6 +123,7 @@ tests/test_probes.py::test_fork_reaching_the_cap_without_eagain_is_not_blocked
 tests/test_probes.py::test_memory_exit_137_without_oom_flag_is_not_blocked
 tests/test_probes.py::test_memory_memory_error_is_blocked
 tests/test_probes.py::test_memory_oom_killed_is_blocked
+tests/test_probes.py::test_the_env_leak_outcome_follows_the_fake_secret
 tests/test_probes.py::test_the_runner_blanks_image_metadata
 tests/test_probes.py::test_there_is_no_name_based_allowlist_left
 tests/test_sandbox_cleanup.py::test_a_failed_container_removal_is_recorded
@@ -128,6 +137,12 @@ tests/test_sandbox.py::test_pid_limit_is_enforced
 tests/test_sandbox.py::test_read_only_root_blocks_writes_outside_work
 tests/test_sandbox.py::test_run_records_isolation_and_workdir_after
 tests/test_sandbox.py::test_timeout_kills_the_container
+tests/test_tmp.py::test_a_leaked_directory_keeps_the_root_visible
+tests/test_tmp.py::test_no_test_scans_the_whole_tempdir
+tests/test_tmp.py::test_temporary_directories_live_under_the_process_root
+tests/test_tmp.py::test_the_root_comes_from_ega_tmpdir
+tests/test_tmp.py::test_the_root_is_made_once_per_process
+tests/test_tmp.py::test_the_sweep_only_touches_its_own_root
 tests/test_trace.py::test_append_is_append_only
 tests/test_trace.py::test_approve_step_flips_approved
 tests/test_trace.py::test_missing_trace_raises

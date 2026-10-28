@@ -1,0 +1,5 @@
+{
+  "status": "done",
+  "tests_claimed_passed": 7,
+  "text": "Fixed the tax base and added a regression test for the plain path; all seven tests pass."
+}

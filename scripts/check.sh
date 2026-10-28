@@ -62,6 +62,12 @@ if [ "${docker_status}" -ne 0 ] && [ "${gate_status}" -eq 0 ]; then
   gate_status=1
 fi
 
+# Exit 3 is check_counts' "degraded": it only happens with EGA_ALLOW_NO_DOCKER=1,
+# and it must never be reported as a pass.
+if [ "${gate_status}" -eq 3 ]; then
+  echo "DEGRADED: the gate accepted a run without Docker (EGA_ALLOW_NO_DOCKER=1)"
+fi
+
 echo
 echo "== temp dir leak check =="
 ega_tmp_after=runs/ega-tmp-after.txt

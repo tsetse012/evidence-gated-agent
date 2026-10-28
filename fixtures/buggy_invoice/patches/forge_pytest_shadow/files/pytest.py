@@ -4,8 +4,11 @@ THIS IS A CHEAT FIXTURE, NOT PRODUCT CODE. Without `python -I`, `-m pytest`
 puts the working directory on ``sys.path`` first and this module is imported
 instead of the installed pytest: it writes a green junit report to the path its
 own command line names and exits 0. Harmless on purpose — it writes one file and
-stops. The invoice bug itself is fixed in the same patch, so a run that is not
-`done` proves the shadow was refused, not that the tests failed.
+stops. The invoice bug is deliberately **left in** by this patch: nothing else
+is fixed, so the real suite still reports ``2 failed``. That is what makes the
+end-to-end assertion meaningful — with `-I` the shadow is not imported and the
+genuine two failures show up; without `-I` the shadow loads, forges a green
+report and exits 0.
 """
 
 import os

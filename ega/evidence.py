@@ -78,6 +78,51 @@ def empty_counts() -> dict[str, int]:
     return {key: 0 for key in COUNT_KEYS}
 
 
+def _is_strict_xpass(failure: ET.Element) -> bool:
+    """Whether a ``<failure>`` is pytest's strict-xpass marker.
+
+    pytest 8.x writes a strict xpass as a plain failure whose message starts
+    with ``[XPASS(strict)]`` and sets no ``type``; older/other releases set
+    ``type="pytest.xpass"``. Both shapes are recognised so the count never
+    depends on which one the image happens to produce.
+    """
+    if (failure.get("type") or "") == "pytest.xpass":
+        return True
+    return (failure.get("message") or "").startswith("[XPASS")
+
+
+def node_id_for_case(classname: str, name: str) -> str:
+    """Rebuild pytest's node id from a junit ``testcase``.
+
+    junit has no node-id column: pytest writes the dotted module as
+    ``classname`` and the test name (with any ``[param]``) as ``name``.
+    ``tests.test_invoice`` / ``test_x`` rebuilds to
+    ``tests/test_invoice.py::test_x``; a doctest's ``invoice.core`` /
+    ``invoice.core._money`` rebuilds to ``invoice/core.py::invoice.core._money``,
+    which is the node id pytest itself prints. The verifier's baseline
+    comparison and the project's own gate therefore share this one function —
+    the same lesson (counting alone cannot tell a full run from a filtered one)
+    applies to both.
+    """
+    if not classname or not name:
+        return ""
+    return f"{classname.replace('.', '/')}.py::{name}"
+
+
+def _case_outcome(case: ET.Element) -> str:
+    """One of ``passed/failed/error/skipped/xfailed/xpassed`` for a testcase."""
+    failure = case.find("failure")
+    error = case.find("error")
+    skipped = case.find("skipped")
+    if failure is not None:
+        return "xpassed" if _is_strict_xpass(failure) else "failed"
+    if error is not None:
+        return "error"
+    if skipped is not None:
+        return "xfailed" if (skipped.get("type") or "") == "pytest.xfail" else "skipped"
+    return "passed"
+
+
 def parse_junit(xml_text: str) -> dict[str, int]:
     """Count testcases in a pytest junit report.
 
@@ -88,20 +133,18 @@ def parse_junit(xml_text: str) -> dict[str, int]:
     root = ET.fromstring(xml_text)
     for case in root.iter("testcase"):
         counts["collected"] += 1
-        failure = case.find("failure")
-        error = case.find("error")
-        skipped = case.find("skipped")
-        if failure is not None:
+        outcome = _case_outcome(case)
+        if outcome == "xpassed":
             counts["failed"] += 1
-            if (failure.get("type") or "") == "pytest.xpass":
-                counts["xpassed"] += 1
-        elif error is not None:
+            counts["xpassed"] += 1
+        elif outcome == "error":
             counts["errors"] += 1
-        elif skipped is not None:
-            if (skipped.get("type") or "") == "pytest.xfail":
-                counts["xfailed"] += 1
-            else:
-                counts["skipped"] += 1
+        elif outcome == "failed":
+            counts["failed"] += 1
+        elif outcome == "skipped":
+            counts["skipped"] += 1
+        elif outcome == "xfailed":
+            counts["xfailed"] += 1
     counts["passed"] = (
         counts["collected"]
         - counts["failed"]
@@ -110,6 +153,68 @@ def parse_junit(xml_text: str) -> dict[str, int]:
         - counts["xfailed"]
     )
     return counts
+
+
+def node_outcomes(junit_path: Path | None) -> dict[str, str]:
+    """``node id -> outcome`` for every testcase in a junit report.
+
+    An unreadable or missing report is an empty mapping (never an exception):
+    the caller decides what an unreadable baseline means, and that is never
+    "no changes".
+    """
+    if junit_path is None:
+        return {}
+    path = Path(junit_path)
+    if not path.is_file():
+        return {}
+    try:
+        root = ET.parse(path).getroot()
+    except (ET.ParseError, OSError):
+        return {}
+    outcomes: dict[str, str] = {}
+    for case in root.iter("testcase"):
+        node = node_id_for_case(case.get("classname") or "", case.get("name") or "")
+        if node:
+            outcomes[node] = _case_outcome(case)
+    return outcomes
+
+
+def node_ids(junit_path: Path | None, *, passed_only: bool = True) -> set[str]:
+    """Every node id in a report, by default only the ones that **passed**.
+
+    With ``passed_only`` a testcase carrying a failure/error/skipped child does
+    not count: it ran, but it did not pass. Collection errors carry an empty
+    classname and are not test node ids.
+    """
+    return {
+        node
+        for node, outcome in node_outcomes(junit_path).items()
+        if outcome == "passed" or not passed_only
+    }
+
+
+def skipped_messages(junit_path: Path | None) -> list[str]:
+    """Messages of plain skips in a report — an xfail is not a skip.
+
+    Used by the project's gate to tolerate only the skips whose reason is the
+    named "Docker is unavailable" string, and nothing else.
+    """
+    if junit_path is None:
+        return []
+    path = Path(junit_path)
+    if not path.is_file():
+        return []
+    try:
+        root = ET.parse(path).getroot()
+    except (ET.ParseError, OSError):
+        return []
+    messages: list[str] = []
+    for case in root.iter("testcase"):
+        skipped = case.find("skipped")
+        if skipped is None or (skipped.get("type") or "") == "pytest.xfail":
+            continue
+        messages.append(skipped.get("message") or "")
+    return messages
 
 
 def _normalise(line: str) -> str:
@@ -256,11 +361,29 @@ def analyze(
         )
 
     # COUNT_MISMATCH — the printed summary disagrees with the report.
+    #
+    # junit has no row for a *non-strict* xpass: pytest writes a plain,
+    # childless <testcase>, which parse_junit can only count as passed. So
+    # `passed` and `xpassed` are compared as a pair against junit's `passed`;
+    # comparing them one by one made a known-bug-fixing patch whose fixture
+    # already carried an xfail marker look like a forged report.
     summary = parse_stdout_summary(stdout)
+    stdout_executed = summary.get("passed", 0) + summary.get("xpassed", 0)
     for key, printed in summary.items():
         if counts["collected"] == 0:
             break
-        if key in counts and printed != counts[key]:
+        if key in ("passed", "xpassed"):
+            if printed != counts[key] and stdout_executed != counts["passed"]:
+                findings.append(
+                    Finding(
+                        "COUNT_MISMATCH",
+                        HIGH,
+                        f"stdout says {printed} {key} but junit reports {counts[key]}",
+                        f"key={key} stdout={printed} junit={counts[key]} "
+                        f"stdout_passed_plus_xpassed={stdout_executed} summary={summary}",
+                    )
+                )
+        elif key in counts and printed != counts[key]:
             findings.append(
                 Finding(
                     "COUNT_MISMATCH",

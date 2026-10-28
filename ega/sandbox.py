@@ -33,6 +33,14 @@ from pathlib import Path
 
 DEFAULT_IMAGE = "ega-sandbox:dev"
 
+# The one reason this project accepts a skip for. Both the conftest that skips
+# docker-marked tests and the gate that reads the junit report use *this*
+# string, so the gate can tolerate exactly those skips — and nothing else — by
+# comparing messages instead of trusting a marker name.
+DOCKER_SKIP_REASON = (
+    "docker daemon not available (`docker info` failed); cannot run sandbox tests"
+)
+
 CONTAINER_UID = 1000
 CONTAINER_GID = 1000
 # Optional second mount, used by the verifier for its own junit report. It is a

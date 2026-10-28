@@ -93,7 +93,9 @@
     <ol id="timeline" class="timeline"></ol>
     <div class="row" style="margin-top:10px">
       <button id="approve" disabled>Approve verdict → would open PR</button>
-      <span id="approve-note" class="muted">approval is only enabled when the verdict is <code>done</code></span>
+      <input id="approve-reason" type="text" placeholder="reason (required for a partial verdict)"
+             style="flex:1;min-width:220px;padding:6px 8px;border-radius:6px;border:1px solid #2a2f3a;background:#0f1218;color:#e6e9ef" />
+      <span id="approve-note" class="muted">approval is enabled for <code>done</code>, and for <code>partial</code> with a written reason</span>
     </div>
   </section>
 </main>
@@ -196,15 +198,26 @@ function render(data) {
      <span class="muted">${esc(st.ts || "")}</span></li>`).join("");
 
   const approved = !!s.approved;
-  $("approve").disabled = !(v.exit_token === "done") || approved;
+  const partial = v.exit_token === "partial";
+  $("approve").disabled = !(v.exit_token === "done" || partial) || approved;
+  $("approve-reason").disabled = !partial || approved;
   $("approve-note").textContent = approved
     ? `approved at ${s.approved_at} — recorded in the trace (no external side effect in this phase)`
-    : (v.exit_token === "done" ? "verdict is done — approval allowed" : "approval is only enabled when the verdict is done");
+    : (v.exit_token === "done"
+        ? "verdict is done — approval allowed"
+        : partial
+          ? "verdict is partial — a written reason is required and is recorded in the trace"
+          : "approval is enabled for done, and for partial with a written reason");
 }
 
 async function approve() {
   if (!currentRun) return;
-  const res = await fetch(`/api/runs/${currentRun}/approve`, { method: "POST" });
+  const reason = $("approve-reason").value.trim();
+  const res = await fetch(`/api/runs/${currentRun}/approve`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ reason }),
+  });
   const data = await res.json();
   if (!res.ok) { $("approve-note").textContent = "approval refused: " + (data.detail || res.status); return; }
   poll();

@@ -199,23 +199,53 @@ def run_pipeline(
         raise
 
 
-def approve(run_id: str, *, runs_root: Path | None = None, actor: str = "human") -> dict:
-    """Record the human approval. No external side effect in this phase."""
+def approve(
+    run_id: str,
+    *,
+    runs_root: Path | None = None,
+    actor: str = "human",
+    reason: str = "",
+) -> dict:
+    """Record the human approval. No external side effect in this phase.
+
+    ``done`` is approved as-is. ``partial`` means the verifier could not prove
+    everything — a test was added, product code merely *mentions* the report
+    path, the baseline was unmeasurable — so it is approvable **only with a
+    written reason**, which is recorded in the trace together with the findings
+    the human is overriding. ``verification-failed`` and ``blocked`` stay
+    unapprovable: nothing there is a judgement call.
+    """
     run_dir = Path(runs_root or runs_dir()) / run_id
     trace_path = run_dir / "trace.jsonl"
     if not trace_path.is_file():
         raise FileNotFoundError(f"unknown run: {run_id}")
     summary = summarize(trace_path)
-    if summary.get("exit_token") != "done":
+    token = summary.get("exit_token")
+    if token not in ("done", "partial"):
+        raise PermissionError(f"run {run_id} is not approvable (verdict={token!r})")
+    reason = (reason or "").strip()
+    codes = [
+        str(finding.get("code"))
+        for finding in (summary.get("findings") or [])
+        if isinstance(finding, dict) and finding.get("code")
+    ]
+    if token == "partial" and not reason:
         raise PermissionError(
-            f"run {run_id} is not approvable (verdict={summary.get('exit_token')!r})"
+            f"run {run_id} is partial; approving it requires a non-empty reason "
+            f"({', '.join(codes) or 'no findings listed'})"
         )
     if summary.get("approved"):
         return summary
     trace = Trace(trace_path, run_id)
     trace.append(
         "approve",
-        inputs={"actor": actor},
-        data={"action": "would open PR", "side_effect": "none (scaffolding phase)"},
+        inputs={"actor": actor, "reason": reason},
+        data={
+            "action": "would open PR",
+            "side_effect": "none (scaffolding phase)",
+            "verdict": token,
+            "reason": reason,
+            "overridden_findings": codes,
+        },
     )
     return write_summary(trace_path)

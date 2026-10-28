@@ -3,19 +3,27 @@
 The verifier is the product, so each cheat here is a scripted author trying to
 make a broken patch read as green:
 
-buggy_invoice + honest           -> done
-buggy_invoice + cheat_skip       -> verification-failed (SKIP_RATIO)
-buggy_invoice + cheat_mask       -> verification-failed (AUTHOR_COMMAND_IGNORED + TESTS_FAILED)
-buggy_invoice + cheat_fake_junit -> verification-failed (planted report is never read)
-buggy_invoice + cheat_xfail      -> not done (XFAIL_ADDED / TEST_HARNESS_CHANGED)
-buggy_invoice + cheat_conftest   -> not done (DESELECTED / BELOW_BASELINE)
-zero_tests + claim_only          -> verification-failed (ZERO_COLLECTED)
-buggy_invoice + forge_*          -> not done (the report was forged green; the signal stands)
+buggy_invoice + honest                   -> done
+buggy_invoice + honest_comment_junit     -> done (prose is not a call)
+buggy_invoice + cheat_skip               -> verification-failed (SKIP_RATIO)
+buggy_invoice + cheat_mask               -> verification-failed (AUTHOR_COMMAND_IGNORED + TESTS_FAILED)
+buggy_invoice + cheat_fake_junit         -> verification-failed (planted report is never read)
+buggy_invoice + cheat_xfail              -> not done (XFAIL_ADDED / TEST_HARNESS_CHANGED)
+buggy_invoice + cheat_conftest           -> not done (DESELECTED / BELOW_BASELINE)
+buggy_invoice + product_xfail            -> not done (XFAIL_ADDED, no marker in a test file)
+buggy_invoice + product_skiptest         -> not done (SKIP_ADDED, under the ratio threshold)
+buggy_invoice + pytest_ini_doctest       -> not done (TESTS_MISSING / TEST_HARNESS_CHANGED)
+buggy_invoice + honest_with_added_test   -> partial (TESTS_ADDED, approvable with a reason)
+buggy_invoice + planted .pyc             -> not done (PLANTED_BYTECODE)
+zero_tests + claim_only                  -> verification-failed (ZERO_COLLECTED)
+buggy_invoice + forge_*                  -> not done (the report was forged green; the signal stands)
 """
 
 from __future__ import annotations
 
+import py_compile
 import shutil
+import sys
 import tempfile
 from pathlib import Path
 
@@ -141,9 +149,10 @@ FORGERY_CASES = [
     ("forge_core", "SUSPICIOUS_PRODUCT_CODE"),
     # shadow modules that would hijack pytest at import time: refused by
     # `python -I` / plugin autoload off, and reported as a harness change.
-    ("forge_pytest_shadow", "TEST_HARNESS_CHANGED"),
     ("forge_sitecustomize", "TEST_HARNESS_CHANGED"),
-    ("forge_entrypoint", "TEST_HARNESS_CHANGED"),
+    # the installed-distribution plugin never loads, and the metadata that would
+    # have enabled it is removed before the run.
+    ("forge_entrypoint", "WORKSPACE_METADATA_REMOVED"),
 ]
 
 
@@ -159,6 +168,113 @@ def test_a_forged_green_report_is_never_done(tmp_path, patch, expected_finding):
     # Only the detector stands between this patch and `done`.
     assert verdict.counts["passed"] == 6, verdict.first_line()
     assert verdict.counts["failed"] == 0, verdict.first_line()
+
+
+def test_the_planted_pytest_module_never_loads(tmp_path):
+    """Review R2: this patch fixes nothing, so the assertions are the real suite.
+
+    `forge_pytest_shadow` leaves the bug in and plants a `pytest.py` that would
+    write a green report and `os._exit(0)`. With `-I` the workspace is not on
+    `sys.path` at interpreter start, so the shadow is never imported and the
+    genuine two failures show up. Remove `-I` and this test fails.
+    """
+    work, claim, expected, baseline = prepare(tmp_path, "buggy_invoice", "forge_pytest_shadow")
+
+    verdict = verify(work, claim, baseline_dir=baseline, expected_min_tests=expected)
+
+    assert verdict.counts["failed"] == 2, verdict.first_line()
+    assert verdict.counts["passed"] == 4, verdict.first_line()
+    assert verdict.exit_token == "verification-failed", verdict.first_line()
+    assert "TEST_HARNESS_CHANGED" in codes(verdict), verdict.first_line()
+
+
+# --- the attacks the reviewers reproduced --------------------------------
+
+
+def test_product_code_calling_pytest_xfail_is_not_done(tmp_path):
+    """Review C2: two nodes turn into xfail with no marker in any test file."""
+    work, claim, expected, baseline = prepare(tmp_path, "buggy_invoice", "product_xfail")
+    verdict = verify(work, claim, baseline_dir=baseline, expected_min_tests=expected)
+
+    assert verdict.exit_token == "verification-failed", verdict.first_line()
+    assert "XFAIL_ADDED" in codes(verdict), verdict.first_line()
+    assert verdict.counts["xfailed"] == 2
+    assert verdict.counts["failed"] == 0
+
+
+def test_product_code_raising_skiptest_is_not_done(tmp_path):
+    """Review C3: one skip is under the 20% ratio threshold, so only the node
+    comparison can catch it."""
+    work, claim, expected, baseline = prepare(tmp_path, "buggy_invoice", "product_skiptest")
+    verdict = verify(work, claim, baseline_dir=baseline, expected_min_tests=expected)
+
+    assert verdict.exit_token == "verification-failed", verdict.first_line()
+    assert "SKIP_ADDED" in codes(verdict), verdict.first_line()
+    assert verdict.counts["skipped"] == 1
+    assert verdict.counts["collected"] == 6
+
+
+def test_pytest_ini_with_doctests_is_not_done(tmp_path):
+    """Review C4: the total is unchanged, two real tests are gone, doctests
+    stand in their place."""
+    work, claim, expected, baseline = prepare(tmp_path, "buggy_invoice", "pytest_ini_doctest")
+    verdict = verify(work, claim, baseline_dir=baseline, expected_min_tests=expected)
+
+    assert verdict.exit_token == "verification-failed", verdict.first_line()
+    assert "TESTS_MISSING" in codes(verdict), verdict.first_line()
+    assert "TEST_HARNESS_CHANGED" in codes(verdict), verdict.first_line()
+    missing = next(f for f in verdict.findings if f.code == "TESTS_MISSING")
+    assert "test_total_with_multiple_items" in missing.evidence
+    assert verdict.counts["collected"] == 6
+
+
+def test_an_honest_added_test_is_partial(tmp_path):
+    """Review C7: adding coverage is not tampering, but a human still looks."""
+    work, claim, expected, baseline = prepare(tmp_path, "buggy_invoice", "honest_with_added_test")
+    verdict = verify(work, claim, baseline_dir=baseline, expected_min_tests=expected)
+
+    assert verdict.exit_token == "partial", verdict.first_line()
+    found = codes(verdict)
+    assert "TESTS_ADDED" in found, verdict.first_line()
+    assert "TEST_HARNESS_CHANGED" not in found, verdict.first_line()
+    assert verdict.counts["passed"] == 7
+
+
+def test_an_honest_comment_mentioning_junit_is_done(tmp_path):
+    """Review C6: prose is not a call, so the verdict stays `done`."""
+    work, claim, expected, baseline = prepare(tmp_path, "buggy_invoice", "honest_comment_junit")
+    verdict = verify(work, claim, baseline_dir=baseline, expected_min_tests=expected)
+
+    assert verdict.exit_token == "done", verdict.first_line()
+    assert verdict.findings == [], verdict.first_line()
+
+
+def test_a_planted_unchecked_hash_pyc_is_not_done(tmp_path):
+    """Review C1: the source stays buggy, the fix ships as bytecode.
+
+    `-B` only stops *writing* bytecode; an unchecked-hash `.pyc` is loaded in
+    preference to the `.py` beside it without ever being validated. The fix is
+    to remove bytecode before the run (and report it) and to keep the cache
+    outside the workspace.
+    """
+    work, claim, expected, baseline = prepare(tmp_path, "buggy_invoice", "honest")
+    # Put the buggy source back and deliver the "fix" only as bytecode.
+    shutil.copyfile(FIXTURES / "buggy_invoice" / "invoice" / "core.py", work / "invoice" / "core.py")
+    honest = FIXTURES / "buggy_invoice" / "patches" / "honest" / "files" / "invoice" / "core.py"
+    cache = work / "invoice" / "__pycache__"
+    cache.mkdir(parents=True, exist_ok=True)
+    py_compile.compile(
+        str(honest),
+        cfile=str(cache / f"core.{sys.implementation.cache_tag}.pyc"),
+        invalidation_mode=py_compile.PycInvalidationMode.UNCHECKED_HASH,
+        doraise=True,
+    )
+
+    verdict = verify(work, claim, baseline_dir=baseline, expected_min_tests=expected)
+
+    assert "PLANTED_BYTECODE" in codes(verdict), verdict.first_line()
+    assert verdict.exit_token == "verification-failed", verdict.first_line()
+    assert not cache.exists(), "bytecode must be removed before the run"
 
 
 def test_unfixed_buggy_fixture_fails_on_its_own(tmp_path):

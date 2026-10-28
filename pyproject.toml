@@ -32,3 +32,8 @@ markers = [
     "docker: needs a working Docker daemon and the ega-sandbox:dev image",
 ]
 filterwarnings = ["error::DeprecationWarning:ega.*"]
+# A non-strict xpass is written to junit as a plain, childless pass, so a
+# required test that someone marked xfail would still count as "passed". With
+# xfail_strict a passing xfail becomes a junit failure and the gate's
+# "only passed nodes count" rule catches it.
+xfail_strict = true

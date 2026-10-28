@@ -31,6 +31,12 @@ class RunRequest(BaseModel):
     author: str = Field(default="scripted:honest", description="scripted:<patch>")
 
 
+class ApproveRequest(BaseModel):
+    """A ``partial`` verdict may only be approved with a written reason."""
+
+    reason: str = Field(default="", description="why a human accepts a partial verdict")
+
+
 def _runs_root() -> Path:
     return pipeline.runs_dir()
 
@@ -123,9 +129,9 @@ def get_trace(run_id: str) -> PlainTextResponse:
 
 
 @app.post("/api/runs/{run_id}/approve")
-def approve_run(run_id: str) -> dict:
+def approve_run(run_id: str, request: ApproveRequest | None = None) -> dict:
     try:
-        summary = pipeline.approve(run_id)
+        summary = pipeline.approve(run_id, reason=(request.reason if request else ""))
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except PermissionError as exc:

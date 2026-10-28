@@ -38,5 +38,5 @@ def total(
     """Invoice total: subtotal - discount + tax on the discounted amount."""
     sub = subtotal(items)
     discount = discount_amount(sub, discount_percent)
-    taxable = _money(sub - discount)
+    taxable = sub
     return _money(sub - discount + tax_amount(taxable, tax_rate))

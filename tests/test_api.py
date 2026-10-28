@@ -35,6 +35,11 @@ def test_fixtures_endpoint_lists_the_demo_targets():
         "forge_pytest_shadow",
         "forge_sitecustomize",
         "honest",
+        "honest_comment_junit",
+        "honest_with_added_test",
+        "product_skiptest",
+        "product_xfail",
+        "pytest_ini_doctest",
     ]
     assert fixtures["buggy_invoice"]["expected_min_tests"] == 6
 

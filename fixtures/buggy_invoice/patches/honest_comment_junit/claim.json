@@ -1,0 +1,5 @@
+{
+  "status": "done",
+  "tests_claimed_passed": 6,
+  "text": "Fixed the tax base; all six tests pass. The added comment only points at the junit report."
+}

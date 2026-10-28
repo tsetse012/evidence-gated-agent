@@ -14,19 +14,21 @@ from pathlib import Path
 
 import pytest
 
-from ega.evidence import HIGH
+from ega.evidence import HIGH, MEDIUM
 from ega.sandbox import SandboxResult
 from ega.verify import (
     CONFIG_FILE,
+    additions_only_test_changes,
     artifact_paths,
     baseline_command,
-    count_xfail_markers,
+    compare_node_outcomes,
     harness_changes,
     load_project_config,
     stage_repo,
+    strip_bytecode,
+    strip_workspace_metadata,
     suspicious_product_code,
     verifier_command,
-    xfail_marker_counts,
 )
 
 
@@ -44,7 +46,11 @@ def make_repo(root: Path) -> Path:
 
 def test_the_verifier_command_is_fixed_and_outside_the_workspace():
     cmd = verifier_command("junit-abc.xml")
-    assert cmd[:6] == ["python", "-I", "-B", "-u", "-m", "pytest"]
+    assert cmd[:5] == ["python", "-I", "-B", "-u", "-X"]
+    # Every cache read and write lands outside the workspace, so a __pycache__
+    # planted in the snapshot is never consulted (`-B` only stops writing).
+    assert cmd[cmd.index("-X") + 1].startswith("pycache_prefix=")
+    assert cmd[cmd.index("-m") + 1] == "pytest"
     assert cmd[cmd.index("-p") + 1] == "no:cacheprovider"
     assert cmd[cmd.index("-o") + 1] == "pythonpath=."
     assert cmd[-1] == "--junitxml=/ega-out/junit-abc.xml"
@@ -52,10 +58,12 @@ def test_the_verifier_command_is_fixed_and_outside_the_workspace():
     assert "sh" not in cmd and "-c" not in cmd
 
 
-def test_the_baseline_command_is_isolated_in_the_same_way():
-    cmd = baseline_command()
-    assert cmd[:6] == ["python", "-I", "-B", "-u", "-m", "pytest"]
-    assert cmd[-1] == "--collect-only"
+def test_the_baseline_command_runs_the_pristine_tests():
+    """Not ``--collect-only``: a count says nothing about what each node did."""
+    cmd = baseline_command("baseline-abc.xml")
+    assert cmd[:5] == ["python", "-I", "-B", "-u", "-X"]
+    assert "--collect-only" not in cmd
+    assert cmd[-1] == "--junitxml=/ega-out/baseline-abc.xml"
     assert not any("/work" in part for part in cmd)
 
 
@@ -324,66 +332,138 @@ def test_a_planted_pytest_shadow_is_a_harness_change(tmp_path, rel):
     assert [change for change, _ in harness_changes(base, snap)] == [rel]
 
 
-# --- xfail markers ---------------------------------------------------------
+# --- node-by-node comparison ------------------------------------------------
 
 
-def test_xfail_marker_counting(tmp_path):
-    repo = make_repo(tmp_path)
-    (repo / "tests" / "test_app.py").write_text(
-        textwrap.dedent(
-            """
-            import pytest
+def codes(findings) -> list[str]:
+    return [finding.code for finding in findings]
 
-            @pytest.mark.xfail(reason="a")
-            def test_a():
-                assert False
 
-            @pytest.mark.xfail(run=False, reason="b")
-            def test_b():
-                assert False
-
-            def test_c():
-                assert True
-            """
-        ),
-        encoding="utf-8",
+def test_a_node_that_disappeared_is_reported_missing():
+    """Review C4 repro: two tests removed, two doctests added, same total."""
+    findings = compare_node_outcomes(
+        {"tests/test_app.py::test_a": "failed", "tests/test_app.py::test_b": "passed"},
+        {"invoice/core.py::invoice.core.subtotal": "passed"},
     )
 
-    assert count_xfail_markers(repo) == 2
+    assert codes(findings) == ["TESTS_MISSING"]
+    assert findings[0].severity == HIGH
+    assert "tests/test_app.py::test_a" in findings[0].evidence
 
 
-PARAMETRISED_XFAIL = '''\
-import pytest
+def test_a_node_that_became_skipped_is_reported():
+    """Review C3 repro: a skip under the 20% ratio threshold used to pass."""
+    findings = compare_node_outcomes(
+        {"tests/test_app.py::test_a": "failed"}, {"tests/test_app.py::test_a": "skipped"}
+    )
+
+    assert codes(findings) == ["SKIP_ADDED"]
+    assert findings[0].severity == HIGH
 
 
-@pytest.mark.parametrize("value", [1, 2])
-@pytest.mark.xfail(reason="known rounding difference")
-def test_known_failure(value):
-    assert value < 0
-'''
+def test_a_node_that_became_xfailed_is_reported():
+    """Review C2 repro: `pytest.xfail()` called from product code."""
+    findings = compare_node_outcomes(
+        {"tests/test_app.py::test_a": "failed"}, {"tests/test_app.py::test_a": "xfailed"}
+    )
+
+    assert codes(findings) == ["XFAIL_ADDED"]
+    assert findings[0].severity == HIGH
 
 
-def test_an_untouched_parametrised_xfail_is_not_an_increase(tmp_path):
-    """Review N6 repro: one marker, two junit xfails — like is compared to like."""
+def test_a_node_already_skipped_in_the_fixture_raises_no_alarm():
+    """Review N6 fairness: a known gap is not evidence of cheating."""
+    findings = compare_node_outcomes(
+        {"tests/test_app.py::test_a": "skipped", "tests/test_app.py::test_b": "xfailed"},
+        {"tests/test_app.py::test_a": "skipped", "tests/test_app.py::test_b": "xfailed"},
+    )
+
+    assert findings == []
+
+
+def test_repairing_a_failing_node_is_not_a_finding():
+    findings = compare_node_outcomes(
+        {"tests/test_app.py::test_a": "failed"}, {"tests/test_app.py::test_a": "passed"}
+    )
+
+    assert findings == []
+
+
+# --- additions-only test changes -------------------------------------------
+
+
+def test_adding_a_test_to_an_existing_module_is_addition_only(tmp_path):
     base = make_repo(tmp_path / "base")
     snap = make_repo(tmp_path / "snap")
-    for root in (base, snap):
-        (root / "tests" / "test_app.py").write_text(PARAMETRISED_XFAIL, encoding="utf-8")
-
-    assert xfail_marker_counts(base, snap) == (1, 1)
-
-
-def test_a_newly_added_xfail_marker_is_an_increase(tmp_path):
-    base = make_repo(tmp_path / "base")
-    snap = make_repo(tmp_path / "snap")
-    (base / "tests" / "test_app.py").write_text(PARAMETRISED_XFAIL, encoding="utf-8")
     (snap / "tests" / "test_app.py").write_text(
-        PARAMETRISED_XFAIL
-        + '\n\n@pytest.mark.xfail(reason="added")\ndef test_other():\n    assert False\n',
+        "def test_ok():\n    assert True\n\ndef test_extra():\n    assert True\n",
         encoding="utf-8",
     )
 
-    assert xfail_marker_counts(base, snap) == (1, 2)
+    assert additions_only_test_changes(base, snap, ["tests/test_app.py"]) is True
+
+
+def test_editing_an_existing_test_is_not_addition_only(tmp_path):
+    base = make_repo(tmp_path / "base")
+    snap = make_repo(tmp_path / "snap")
+    (snap / "tests" / "test_app.py").write_text(
+        "def test_ok():\n    assert 1\n", encoding="utf-8"
+    )
+
+    assert additions_only_test_changes(base, snap, ["tests/test_app.py"]) is False
+
+
+def test_a_removed_test_function_is_not_addition_only(tmp_path):
+    base = make_repo(tmp_path / "base")
+    snap = make_repo(tmp_path / "snap")
+    (snap / "tests" / "test_app.py").write_text("X = 1\n", encoding="utf-8")
+
+    assert additions_only_test_changes(base, snap, ["tests/test_app.py"]) is False
+
+
+def test_a_new_test_file_is_not_addition_only(tmp_path):
+    base = make_repo(tmp_path / "base")
+    snap = make_repo(tmp_path / "snap")
+    (snap / "tests" / "test_new.py").write_text("def test_x():\n    assert True\n", encoding="utf-8")
+
+    assert additions_only_test_changes(base, snap, ["tests/test_new.py"]) is False
+
+
+def test_a_changed_conftest_is_not_addition_only(tmp_path):
+    base = make_repo(tmp_path / "base")
+    snap = make_repo(tmp_path / "snap")
+    (snap / "conftest.py").write_text("import sys  # changed\n", encoding="utf-8")
+
+    assert additions_only_test_changes(base, snap, ["conftest.py"]) is False
+
+
+# --- bytecode and install metadata -----------------------------------------
+
+
+def test_planted_bytecode_is_removed_and_listed(tmp_path):
+    repo = make_repo(tmp_path)
+    cache = repo / "app" / "__pycache__"
+    cache.mkdir(parents=True)
+    (cache / "core.cpython-313.pyc").write_bytes(b"\x00\x01")
+    (repo / "loose.pyc").write_bytes(b"\x00")
+
+    removed = strip_bytecode(repo)
+
+    assert removed == ["app/__pycache__/core.cpython-313.pyc", "loose.pyc"]
+    assert not cache.exists()
+    assert not (repo / "loose.pyc").exists()
+
+
+def test_install_metadata_is_removed_and_listed(tmp_path):
+    repo = make_repo(tmp_path)
+    (repo / "invoice.egg-info").mkdir()
+    (repo / "invoice.egg-info" / "PKG-INFO").write_text("Name: invoice\n", encoding="utf-8")
+
+    removed = strip_workspace_metadata(repo)
+
+    assert "invoice.egg-info/PKG-INFO" in removed
+    assert "invoice.egg-info" in removed
+    assert not (repo / "invoice.egg-info").exists()
 
 
 # --- product code that can forge a result ----------------------------------
@@ -417,9 +497,44 @@ def test_product_code_that_forges_a_report_is_flagged(tmp_path):
 
     assert finding is not None
     assert finding.code == "SUSPICIOUS_PRODUCT_CODE"
-    assert finding.severity == HIGH
+    # A signal, not a conviction: the verdict lands on `partial`, where a human
+    # decides, exactly as README's threat model says.
+    assert finding.severity == MEDIUM
     assert "app.py:7" in finding.evidence
     assert "sys.argv" in finding.evidence
+
+
+def test_a_comment_mentioning_junit_is_not_flagged(tmp_path):
+    """Review C6 repro: an honest patch that merely *mentions* the report."""
+    base = make_repo(tmp_path / "base")
+    snap = make_repo(tmp_path / "snap")
+    (snap / "app.py").write_text(
+        "VALUE = 1\n# covered by the junit report; nothing writes /ega-out here\n",
+        encoding="utf-8",
+    )
+
+    assert suspicious_product_code(base, snap) is None
+
+
+def test_a_docstring_mentioning_the_report_is_not_flagged(tmp_path):
+    base = make_repo(tmp_path / "base")
+    snap = make_repo(tmp_path / "snap")
+    (snap / "app.py").write_text(
+        'def f():\n    """Reads sys.argv and the junit report — prose only."""\n    return 1\n',
+        encoding="utf-8",
+    )
+
+    assert suspicious_product_code(base, snap) is None
+
+
+def test_an_fstring_literal_mentioning_the_report_is_not_flagged(tmp_path):
+    base = make_repo(tmp_path / "base")
+    snap = make_repo(tmp_path / "snap")
+    (snap / "app.py").write_text(
+        'NAME = "x"\nMESSAGE = f"see the junit report for {NAME}"\n', encoding="utf-8"
+    )
+
+    assert suspicious_product_code(base, snap) is None
 
 
 def test_an_honest_product_change_is_not_flagged(tmp_path):
@@ -480,11 +595,17 @@ def fake_sandbox(
     *,
     verify_junit,
     verify_stdout,
-    baseline_stdout,
+    baseline_junit=None,
+    baseline_stdout="",
     baseline_exit=0,
     baseline_oom=False,
 ):
-    """Replace ``sandbox.run`` with a canned run; the junit is written for real."""
+    """Replace ``sandbox.run`` with a canned run; the junit is written for real.
+
+    A baseline run is recognised by its report name (``baseline-…``); the
+    verifier's own run writes ``junit-…``. Both are real files, so the node
+    comparison runs against real XML rather than strings.
+    """
     from ega import verify as verify_module
 
     after_dirs: list[Path] = []
@@ -494,11 +615,15 @@ def fake_sandbox(
         after.mkdir(parents=True, exist_ok=True)
         after_dirs.append(after)
         assert env == {"PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1"}, env
-        if "--collect-only" in cmd:
+        junit_arg = next(part for part in cmd if part.startswith("--junitxml="))
+        name = junit_arg.split("=", 1)[1].rsplit("/", 1)[-1]
+        if name.startswith("baseline-"):
+            if baseline_junit is not None:
+                (Path(out_dir) / name).write_text(baseline_junit, encoding="utf-8")
             return SandboxResult(
                 exit_code=baseline_exit,
                 stdout=baseline_stdout,
-                stderr="" if baseline_exit == 0 else "ERROR: found no collectors",
+                stderr="" if baseline_exit in (0, 1) else "ERROR: found no collectors",
                 duration_s=0.01,
                 timed_out=False,
                 oom_killed=baseline_oom,
@@ -506,8 +631,6 @@ def fake_sandbox(
                 workdir_after=after,
                 container_name="ega-fake",
             )
-        junit_arg = next(part for part in cmd if part.startswith("--junitxml="))
-        name = junit_arg.split("=", 1)[1].rsplit("/", 1)[-1]
         (Path(out_dir) / name).write_text(verify_junit, encoding="utf-8")
         return SandboxResult(
             exit_code=0, stdout=verify_stdout, stderr="", duration_s=0.01,
@@ -519,8 +642,27 @@ def fake_sandbox(
     return after_dirs
 
 
+PARAMETRISED_XFAIL = '''\
+import pytest
+
+
+@pytest.mark.parametrize("value", [1, 2])
+@pytest.mark.xfail(reason="known rounding difference")
+def test_known_failure(value):
+    assert value < 0
+
+
+def test_ok():
+    assert True
+'''
+
+
 def test_a_pristine_parametrised_xfail_raises_no_alarm(tmp_path, monkeypatch):
-    """Review N6 end to end: the fixture already xfails; an untouched snapshot is `done`."""
+    """Review N6 end to end: the fixture already xfails; an untouched snapshot is `done`.
+
+    The comparison is per node id, so one marker covering two parametrised
+    cases is two nodes on both sides — like is compared to like.
+    """
     from ega.verify import Claim, verify
 
     base = make_repo(tmp_path / "fixture")
@@ -528,47 +670,193 @@ def test_a_pristine_parametrised_xfail_raises_no_alarm(tmp_path, monkeypatch):
     for root in (base, snap):
         (root / "tests" / "test_app.py").write_text(PARAMETRISED_XFAIL, encoding="utf-8")
 
+    same = _junit(
+        ("test_known_failure[1]", "xfail"),
+        ("test_known_failure[2]", "xfail"),
+        ("test_ok", "passed"),
+    )
     fake_sandbox(
         monkeypatch,
         tmp_path,
-        verify_junit=_junit(("test_known_failure[1]", "xfail"), ("test_known_failure[2]", "xfail"),
-                            ("test_ok", "passed")),
+        verify_junit=same,
         verify_stdout="1 passed, 2 xfailed in 0.01s",
-        baseline_stdout="3 tests collected in 0.01s",
+        baseline_junit=same,
+        baseline_stdout="1 passed, 2 xfailed in 0.01s",
+        baseline_exit=1,
     )
 
     verdict = verify(snap, Claim(status="done", tests_claimed_passed=1), baseline_dir=base)
 
-    assert "XFAIL_ADDED" not in [f.code for f in verdict.findings], verdict.first_line()
+    found = codes(verdict.findings)
+    assert "XFAIL_ADDED" not in found, verdict.first_line()
+    assert "SKIP_ADDED" not in found, verdict.first_line()
     assert verdict.counts["xfailed"] == 2
     assert verdict.exit_token == "done", verdict.first_line()
 
 
-def test_an_added_xfail_marker_is_reported(tmp_path, monkeypatch):
+def test_a_failing_node_that_becomes_xfailed_is_reported(tmp_path, monkeypatch):
+    """Review C2 end to end: product code calls `pytest.xfail()`."""
     from ega.verify import Claim, verify
 
     base = make_repo(tmp_path / "fixture")
     snap = make_repo(tmp_path / "snapshot")
-    (base / "tests" / "test_app.py").write_text(PARAMETRISED_XFAIL, encoding="utf-8")
+    text = "def test_a():\n    assert True\n"
+    for root in (base, snap):
+        (root / "tests" / "test_app.py").write_text(text, encoding="utf-8")
+
+    fake_sandbox(
+        monkeypatch,
+        tmp_path,
+        verify_junit=_junit(("test_a", "xfail"), ("test_b", "passed")),
+        verify_stdout="1 passed, 1 xfailed in 0.01s",
+        baseline_junit=_junit(("test_a", "failed"), ("test_b", "passed")),
+        baseline_stdout="1 failed, 1 passed in 0.01s",
+        baseline_exit=1,
+    )
+
+    verdict = verify(snap, Claim(status="done", tests_claimed_passed=1), baseline_dir=base)
+
+    assert "XFAIL_ADDED" in codes(verdict.findings), verdict.first_line()
+    assert verdict.exit_token == "verification-failed", verdict.first_line()
+
+
+def test_a_node_that_is_gone_is_reported_missing_end_to_end(tmp_path, monkeypatch):
+    """Review C4 end to end: the same total, a doctest in place of a real test."""
+    from ega.verify import Claim, verify
+
+    base = make_repo(tmp_path / "fixture")
+    snap = make_repo(tmp_path / "snapshot")
+    text = "def test_a():\n    assert True\n"
+    for root in (base, snap):
+        (root / "tests" / "test_app.py").write_text(text, encoding="utf-8")
+
+    fake_sandbox(
+        monkeypatch,
+        tmp_path,
+        verify_junit=_junit(("test_a", "passed"), ("test_b", "passed")),
+        verify_stdout="2 passed in 0.01s",
+        baseline_junit=_junit(("test_a", "passed"), ("test_b", "passed"), ("test_c", "passed")),
+        baseline_stdout="3 passed in 0.01s",
+    )
+
+    verdict = verify(snap, Claim(status="done", tests_claimed_passed=2), baseline_dir=base)
+
+    assert "TESTS_MISSING" in codes(verdict.findings), verdict.first_line()
+    assert verdict.exit_token == "verification-failed", verdict.first_line()
+
+
+def test_adding_a_test_only_is_partial_not_failed(tmp_path, monkeypatch):
+    """Review C7: an honest regression test is an addition, so it is a medium."""
+    from ega.verify import Claim, verify
+
+    base = make_repo(tmp_path / "fixture")
+    snap = make_repo(tmp_path / "snapshot")
     (snap / "tests" / "test_app.py").write_text(
-        PARAMETRISED_XFAIL + '\n\n@pytest.mark.xfail(reason="added")\ndef test_other():\n    assert False\n',
+        "def test_ok():\n    assert True\n\ndef test_extra():\n    assert True\n",
         encoding="utf-8",
     )
 
     fake_sandbox(
         monkeypatch,
         tmp_path,
-        verify_junit=_junit(("test_known_failure[1]", "xfail"), ("test_known_failure[2]", "xfail"),
-                            ("test_other", "xfail"), ("test_ok", "passed")),
-        verify_stdout="1 passed, 3 xfailed in 0.01s",
-        baseline_stdout="3 tests collected in 0.01s",
+        verify_junit=_junit(("test_ok", "passed"), ("test_extra", "passed")),
+        verify_stdout="2 passed in 0.01s",
+        baseline_junit=_junit(("test_ok", "passed")),
+        baseline_stdout="1 passed in 0.01s",
+    )
+
+    verdict = verify(snap, Claim(status="done", tests_claimed_passed=2), baseline_dir=base)
+
+    found = codes(verdict.findings)
+    assert "TESTS_ADDED" in found, verdict.first_line()
+    assert "TEST_HARNESS_CHANGED" not in found, verdict.first_line()
+    assert verdict.exit_token == "partial", verdict.first_line()
+
+
+def test_an_edited_test_is_still_a_high_harness_change(tmp_path, monkeypatch):
+    """The downgrade only covers additions; a touched assertion stays blocked."""
+    from ega.verify import Claim, verify
+
+    base = make_repo(tmp_path / "fixture")
+    snap = make_repo(tmp_path / "snapshot")
+    (snap / "tests" / "test_app.py").write_text("def test_ok():\n    assert 1\n", encoding="utf-8")
+
+    same = _junit(("test_ok", "passed"))
+    fake_sandbox(
+        monkeypatch,
+        tmp_path,
+        verify_junit=same,
+        verify_stdout="1 passed in 0.01s",
+        baseline_junit=same,
+        baseline_stdout="1 passed in 0.01s",
     )
 
     verdict = verify(snap, Claim(status="done", tests_claimed_passed=1), baseline_dir=base)
 
-    codes = [f.code for f in verdict.findings]
-    assert "XFAIL_ADDED" in codes, verdict.first_line()
-    assert verdict.exit_token != "done", verdict.first_line()
+    found = codes(verdict.findings)
+    assert "TEST_HARNESS_CHANGED" in found, verdict.first_line()
+    assert "TESTS_ADDED" not in found, verdict.first_line()
+    assert verdict.exit_token == "verification-failed", verdict.first_line()
+
+
+def test_a_planted_pyc_is_removed_and_blocks_done(tmp_path, monkeypatch):
+    """Review C1 end to end: the source stays buggy, the fix ships as bytecode."""
+    from ega.verify import Claim, verify
+
+    base = make_repo(tmp_path / "fixture")
+    snap = make_repo(tmp_path / "snapshot")
+    text = "def test_a():\n    assert True\n"
+    for root in (base, snap):
+        (root / "tests" / "test_app.py").write_text(text, encoding="utf-8")
+    cache = snap / "app" / "__pycache__"
+    cache.mkdir(parents=True)
+    (cache / "core.cpython-313.pyc").write_bytes(b"\x00\x01")
+
+    same = _junit(("test_a", "passed"))
+    fake_sandbox(
+        monkeypatch,
+        tmp_path,
+        verify_junit=same,
+        verify_stdout="1 passed in 0.01s",
+        baseline_junit=same,
+        baseline_stdout="1 passed in 0.01s",
+    )
+
+    verdict = verify(snap, Claim(status="done", tests_claimed_passed=1), baseline_dir=base)
+
+    assert "PLANTED_BYTECODE" in codes(verdict.findings), verdict.first_line()
+    assert verdict.exit_token == "verification-failed", verdict.first_line()
+    assert not (snap / "app" / "__pycache__").exists()
+
+
+def test_install_metadata_is_a_medium_note_not_a_harness_change(tmp_path, monkeypatch):
+    """Review C10: `pip install -e .` leftovers are removed and only reported."""
+    from ega.verify import Claim, verify
+
+    base = make_repo(tmp_path / "fixture")
+    snap = make_repo(tmp_path / "snapshot")
+    text = "def test_a():\n    assert True\n"
+    for root in (base, snap):
+        (root / "tests" / "test_app.py").write_text(text, encoding="utf-8")
+    (snap / "invoice.egg-info").mkdir()
+    (snap / "invoice.egg-info" / "PKG-INFO").write_text("Name: invoice\n", encoding="utf-8")
+
+    same = _junit(("test_a", "passed"))
+    fake_sandbox(
+        monkeypatch,
+        tmp_path,
+        verify_junit=same,
+        verify_stdout="1 passed in 0.01s",
+        baseline_junit=same,
+        baseline_stdout="1 passed in 0.01s",
+    )
+
+    verdict = verify(snap, Claim(status="done", tests_claimed_passed=1), baseline_dir=base)
+
+    found = codes(verdict.findings)
+    assert "WORKSPACE_METADATA_REMOVED" in found, verdict.first_line()
+    assert "TEST_HARNESS_CHANGED" not in found, verdict.first_line()
+    assert verdict.exit_token == "partial", verdict.first_line()
 
 
 def test_without_a_baseline_the_verdict_is_never_done(tmp_path, monkeypatch):
@@ -585,14 +873,22 @@ def test_without_a_baseline_the_verdict_is_never_done(tmp_path, monkeypatch):
         tmp_path,
         verify_junit=_junit(("test_a", "passed")),
         verify_stdout="1 passed in 0.01s",
-        baseline_stdout="1 test collected in 0.01s",
     )
 
     verdict = verify(snap, Claim(status="done", tests_claimed_passed=1), baseline_dir=None)
 
-    codes = [f.code for f in verdict.findings]
-    assert "BASELINE_UNAVAILABLE" in codes, verdict.first_line()
+    found = codes(verdict.findings)
+    assert "BASELINE_UNAVAILABLE" in found, verdict.first_line()
     assert verdict.exit_token == "partial", verdict.first_line()
+
+
+def test_r1_there_is_no_way_to_skip_the_baseline_run(tmp_path, monkeypatch):
+    """Review R1: the `run_baseline=False` escape hatch no longer exists."""
+    import inspect
+
+    from ega.verify import verify
+
+    assert "run_baseline" not in inspect.signature(verify).parameters
 
 
 @pytest.mark.parametrize(
@@ -618,15 +914,16 @@ def test_an_unclean_baseline_is_not_trusted(tmp_path, monkeypatch, baseline_exit
         tmp_path,
         verify_junit=_junit(("test_a", "passed")),
         verify_stdout="1 passed in 0.01s",
-        baseline_stdout="12 tests collected in 0.01s",
+        baseline_junit=_junit(("test_a", "passed")),
+        baseline_stdout="1 passed in 0.01s",
         baseline_exit=baseline_exit,
         baseline_oom=baseline_oom,
     )
 
     verdict = verify(snap, Claim(status="done", tests_claimed_passed=1), baseline_dir=base)
 
-    codes = [f.code for f in verdict.findings]
-    assert "BASELINE_UNAVAILABLE" in codes, verdict.first_line()
+    found = codes(verdict.findings)
+    assert "BASELINE_UNAVAILABLE" in found, verdict.first_line()
     assert verdict.baseline_collected is None, verdict.baseline_collected
-    assert "BELOW_BASELINE" not in codes, verdict.first_line()
+    assert "BELOW_BASELINE" not in found, verdict.first_line()
     assert verdict.exit_token != "done", verdict.first_line()

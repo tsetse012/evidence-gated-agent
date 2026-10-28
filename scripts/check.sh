@@ -10,6 +10,12 @@ set -uo pipefail
 cd "$(dirname "$0")/.."
 mkdir -p runs
 
+# Temp-dir leak check: a verifier run owns every ega-* directory it creates, so
+# the number of them in TMPDIR must not grow across the whole suite.
+tmp_root="${TMPDIR:-/tmp}"
+ega_tmp_before=runs/ega-tmp-before.txt
+find "${tmp_root}" -maxdepth 1 -name 'ega-*' -print | sort > "${ega_tmp_before}"
+
 echo "== [1/4] build sandbox image =="
 if ! bash scripts/build_image.sh; then
   echo "FAIL: could not build the sandbox image"
@@ -57,7 +63,23 @@ if [ "${docker_status}" -ne 0 ] && [ "${gate_status}" -eq 0 ]; then
 fi
 
 echo
-echo "== last 12 lines of the full log =="
-tail -n 12 runs/check.log
+echo "== temp dir leak check =="
+ega_tmp_after=runs/ega-tmp-after.txt
+find "${tmp_root}" -maxdepth 1 -name 'ega-*' -print | sort > "${ega_tmp_after}"
+leaked=$(comm -13 "${ega_tmp_before}" "${ega_tmp_after}")
+before_count=$(wc -l < "${ega_tmp_before}" | tr -d ' ')
+after_count=$(wc -l < "${ega_tmp_after}" | tr -d ' ')
+echo "ega-* under ${tmp_root}: before=${before_count} after=${after_count}"
+if [ -n "${leaked}" ]; then
+  echo "FAIL: the run leaked ega-* temp directories:"
+  echo "${leaked}" | head -n 20
+  [ "${gate_status}" -eq 0 ] && gate_status=1
+else
+  echo "OK: no ega-* temp directories leaked"
+fi
+
+echo
+echo "== last 40 lines of the full log =="
+tail -n 40 runs/check.log
 
 exit "${gate_status}"

@@ -2,11 +2,15 @@
 """Post-pytest gate: our own suite must not be a false green.
 
 Fails when: pytest itself failed, nothing was collected, any test failed or
-errored, a required node id from ``--expected-tests`` never ran, or
-docker-marked tests were skipped while Docker is available.
+errored, any test was skipped/xfailed/xpassed (skips are tolerated only when
+Docker is unavailable, where they are the named-reason docker skips), a
+required node id from ``--expected-tests`` did not **pass**, or docker-marked
+tests were skipped while Docker is available.
 
 The node-id check is what closes the "an outside filter shrank the run" hole:
-counting alone cannot tell a full run from a selected one.
+counting alone cannot tell a full run from a selected one. It counts only
+testcases that passed — a required test that merely *ran* (skipped, xfailed)
+proves nothing, which is exactly how 148/149 xfails used to read as green.
 """
 
 from __future__ import annotations
@@ -31,12 +35,14 @@ def counts_from(path: Path) -> dict[str, int] | None:
     return parse_junit(path.read_text(encoding="utf-8"))
 
 
-def node_ids(path: Path | None) -> set[str]:
+def node_ids(path: Path | None, *, passed_only: bool = True) -> set[str]:
     """``tests/mod.py::test_name`` for every testcase pytest actually wrote.
 
     junit has no node id column, but pytest fills ``classname`` with the dotted
     module and ``name`` with the function (plus ``[param]``), which rebuilds it.
-    Collection errors carry an empty classname and are not test node ids.
+    With ``passed_only`` a testcase carrying a failure/error/skipped child does
+    not count: it ran, but it did not pass. Collection errors carry an empty
+    classname and are not test node ids.
     """
     if path is None or not path.is_file():
         return set()
@@ -45,6 +51,12 @@ def node_ids(path: Path | None) -> set[str]:
         classname = case.get("classname") or ""
         name = case.get("name") or ""
         if not classname or not name:
+            continue
+        if passed_only and (
+            case.find("failure") is not None
+            or case.find("error") is not None
+            or case.find("skipped") is not None
+        ):
             continue
         found.add(f"{classname.replace('.', '/')}.py::{name}")
     return found
@@ -87,6 +99,7 @@ def main() -> int:
 
     problems: list[str] = []
     counts = counts_from(args.junit)
+    docker_is_available = docker_available()
     show("full suite", counts)
 
     if args.pytest_status != 0:
@@ -102,6 +115,22 @@ def main() -> int:
             problems.append(f"{counts['errors']} test(s) errored")
         if counts["passed"] == 0:
             problems.append("no test passed")
+        if counts["xfailed"]:
+            problems.append(
+                f"{counts['xfailed']} test(s) xfailed; an expected failure is not a pass"
+            )
+        if counts["xpassed"]:
+            problems.append(f"{counts['xpassed']} test(s) xpassed; a strict xpass is a failure")
+        if counts["skipped"]:
+            if docker_is_available:
+                problems.append(
+                    f"{counts['skipped']} test(s) skipped; a skipped test proves nothing"
+                )
+            else:
+                print(
+                    f"note: {counts['skipped']} skipped test(s) tolerated because Docker is "
+                    "unavailable (named-reason docker skips)"
+                )
 
     expected = load_expected(args.expected_tests) if args.expected_tests else None
 
@@ -110,12 +139,12 @@ def main() -> int:
         missing = [node for node in expected.get(FULL, []) if node not in actual]
         print(
             f"required node ids [full]: {len(expected.get(FULL, []))} required, "
-            f"{len(actual)} executed, {len(missing)} missing"
+            f"{len(actual)} passed, {len(missing)} missing"
         )
         for node in missing:
-            problems.append(f"required test did not run: {node}")
+            problems.append(f"required test did not pass: {node}")
 
-    if docker_available():
+    if docker_is_available:
         docker_counts = counts_from(args.docker_junit) if args.docker_junit else None
         show("docker-marked suite", docker_counts)
         if docker_counts is None:
@@ -127,6 +156,8 @@ def main() -> int:
                 problems.append(
                     f"{docker_counts['skipped']} docker-marked test(s) skipped while docker is available"
                 )
+            if docker_counts["xfailed"] or docker_counts["xpassed"]:
+                problems.append("docker-marked suite has xfailed/xpassed tests")
             if docker_counts["failed"] or docker_counts["errors"]:
                 problems.append("docker-marked suite failed")
         if expected is not None and args.docker_junit:
@@ -134,10 +165,10 @@ def main() -> int:
             missing = [node for node in expected.get(DOCKER, []) if node not in docker_actual]
             print(
                 f"required node ids [docker]: {len(expected.get(DOCKER, []))} required, "
-                f"{len(docker_actual)} executed, {len(missing)} missing"
+                f"{len(docker_actual)} passed, {len(missing)} missing"
             )
             for node in missing:
-                problems.append(f"required docker test did not run: {node}")
+                problems.append(f"required docker test did not pass: {node}")
     else:
         print("docker-marked suite: docker is NOT available; skipped with a named reason")
         if expected is not None and expected.get(DOCKER):

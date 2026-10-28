@@ -10,6 +10,7 @@ without Docker still covers the review's repro cases.
 from __future__ import annotations
 
 import errno
+import shutil
 
 import pytest
 
@@ -194,7 +195,12 @@ def test_env_probe_would_detect_a_leak_if_one_were_forwarded(tmp_path):
         probes.PROBE_LIMITS,
         env={probes.FAKE_SECRET_ENV: probes.FAKE_SECRET_VALUE},
     )
-    payload = probes._payload(result)
-    assert payload is not None, result.stderr
-    assert payload["fake_seen"] == [probes.FAKE_SECRET_ENV]
-    assert probes.FAKE_SECRET_ENV in payload["suspects"]
+    try:
+        payload = probes._payload(result)
+        assert payload is not None, result.stderr
+        assert payload["fake_seen"] == [probes.FAKE_SECRET_ENV]
+        assert probes.FAKE_SECRET_ENV in payload["suspects"]
+    finally:
+        # The run's own copy of /work is ours to remove; leaking it here is the
+        # same "the harness leaves ega-* behind" failure the gate checks for.
+        shutil.rmtree(result.workdir_after, ignore_errors=True)

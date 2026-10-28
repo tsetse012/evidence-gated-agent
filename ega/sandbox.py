@@ -472,14 +472,14 @@ def run(
                     if after_dir is not None
                     else Path(tempfile.mkdtemp(prefix="ega-after-"))
                 )
+                # Recorded before anything can fail: a failed copy must not
+                # leave this directory behind with no reference to remove it.
+                after_dir = target
                 target.mkdir(parents=True, exist_ok=True)
                 if work.is_dir():
                     excluded = copy_tree(work, target, strict=False)
-                after_dir = target
             except OSError as exc:
                 cleanup_errors.append(f"output copy failed: {exc}")
-                if after_dir is None:
-                    after_dir = Path(tempfile.mkdtemp(prefix="ega-after-"))
             finally:
                 shutil.rmtree(work_root, ignore_errors=True)
 

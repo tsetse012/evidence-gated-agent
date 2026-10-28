@@ -4,17 +4,29 @@ The verifier trusts nothing the author controls. Concretely:
 
 * the pytest command is **fixed here**; whatever the snapshot declares in
   ``ega.toml`` is recorded but never executed (``AUTHOR_COMMAND_IGNORED`` when
-  the declared command differs from the pristine fixture's);
+  the declared command differs from the pristine fixture's). It runs in
+  **isolated mode** (``python -I``) with plugin auto-loading disabled, so a
+  ``pytest.py`` / ``sitecustomize.py`` / ``.pth`` / ``*.dist-info`` plugin the
+  author dropped into the workspace is never imported at interpreter start;
 * the junit report goes to ``/ega-out`` — a second, empty host directory
   created for this run only, mounted only into the verifier container, under a
   random nonce name — so a pre-planted ``.ega/junit.xml`` is never read. Any
   ``.ega/`` inside the snapshot is deleted before the run, and the report must
   have been written after the run started (``JUNIT_STALE``);
 * the expected test count comes from the **pristine** fixture, collected in its
-  own fresh sandbox (``BELOW_BASELINE``);
-* the test harness itself is compared against the pristine fixture
-  (``TEST_HARNESS_CHANGED``, ``XFAIL_ADDED``), and pytest's own deselection
-  count is reported (``DESELECTED``);
+  own fresh sandbox, and an unclean baseline run is never trusted
+  (``BELOW_BASELINE``, ``BASELINE_UNAVAILABLE``);
+* the test harness itself is compared against the pristine fixture: pytest's
+  own ``python_files`` patterns anywhere in the tree, any ``conftest.py``,
+  the config files, and anything that can shadow or extend pytest itself
+  (``TEST_HARNESS_CHANGED``, ``XFAIL_ADDED``), plus pytest's deselection count
+  (``DESELECTED``). Nothing but run byproducts is ignored in that comparison;
+* **threat model split.** A sloppy author (skips, xfails, masking, weakened
+  tests) is *blocked*. An author attacking the verifier — product code that
+  forges the report from inside the same process as pytest — cannot be blocked
+  by the runner alone, so added product-code lines that can forge a result are
+  reported as ``SUSPICIOUS_PRODUCT_CODE``: a signal that keeps the verdict at
+  best ``partial``, not a proof of innocence;
 * declared artifacts must resolve inside the result workspace
   (``ARTIFACT_ESCAPE``), and nothing that escaped the workspace is ever read
   on the host.
@@ -54,8 +66,43 @@ DEFAULT_TEST_COMMAND = "python -m pytest -q --junitxml=/work/.ega/junit.xml"
 # The verifier's own command: no shell, no cache, and a junit outside /work.
 VERIFIER_JUNIT_DIR = sandbox.OUT_MOUNT
 HARNESS_FILE_NAMES = frozenset({"pytest.ini", "setup.cfg", "tox.ini", "pyproject.toml"})
+# pytest's default `python_files` patterns, matched anywhere in the tree: a test
+# file outside `tests/` is still part of the harness.
+_TEST_FILE_NAME = re.compile(r"^(?:test_.*|.*_test)\.py$")
+# Anything that can shadow or extend pytest inside the workspace. None of these
+# is loaded any more (`-I` + `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1`), but creating
+# one is still a harness change and must never pass unnoticed.
+_SHADOW_NAMES = frozenset({"pytest.py", "_pytest.py", "sitecustomize.py", "usercustomize.py"})
+_SHADOW_SUFFIXES = (".pth", ".egg-link")
+_SHADOW_DIR_SUFFIXES = (".dist-info", ".egg-info")
+# Runtime byproducts only. Every other entry — every directory, every file — is
+# compared, so there is no per-path ignore list a cheat can hide in.
+_RUN_BYPRODUCTS = frozenset({"__pycache__", ".pytest_cache", ".ega", ".git"})
+# Authoring metadata that never reaches the author's workspace in the first
+# place (the fixture copy drops it); the pristine baseline is staged the same
+# way before it is compared, so the diff has nothing to ignore.
+AUTHORING_METADATA = ("patches", "expectation.json")
+# Added product-code lines that can write a test result from inside the pytest
+# process. Not proof of guilt — an honest CLI patch may legitimately touch
+# `sys.argv` — but a hit keeps the run from ever reading as `done`.
+SUSPICIOUS_PRODUCT_TOKENS = (
+    "/ega-out",
+    "junit",
+    "--junitxml",
+    "os._exit",
+    "os.kill",
+    "getppid",
+    "sys.argv",
+    "/proc/self",
+    "builtins",
+    "sys.modules[",
+    "atexit",
+)
+# Environment for the verifier's own pytest run. `-I` implies `-E`, so
+# PYTHON* variables are ignored by the interpreter and the command carries
+# `-B`/`-u` itself; pytest reads PYTEST_* from os.environ normally.
+VERIFIER_ENV = {"PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1"}
 _XFAIL_MARKER = re.compile(r"(?:mark\.xfail|pytest\.xfail)\s*\(")
-_SKIP_DIRS = frozenset({".ega", ".pytest_cache", "__pycache__", ".git", "patches"})
 
 
 @dataclass(frozen=True)
@@ -140,17 +187,40 @@ def load_project_config(snapshot_dir: Path) -> ProjectConfig:
     return ProjectConfig(test_command=str(command), artifacts=artifacts)
 
 
-def verifier_command(junit_name: str) -> list[str]:
-    """The one command the verifier runs. Nothing from the snapshot feeds it."""
+def _isolated_pytest(*extra: str) -> list[str]:
+    """Our own pytest invocation, isolated from anything inside the workspace.
+
+    ``-I`` implies ``-E``, ``-P`` and ``-s``: the workspace is not on
+    ``sys.path`` at interpreter start, so ``pytest.py`` or ``sitecustomize.py``
+    planted next to the code is never imported; ``PYTHON*`` variables are
+    ignored, hence the explicit ``-B``/``-u``. ``-o pythonpath=.`` re-adds the
+    rootdir *after* startup, through pytest's own config, so the package under
+    test is importable while an interpreter-start hook is not.
+    """
     return [
         "python",
+        "-I",
+        "-B",
+        "-u",
         "-m",
         "pytest",
         "-q",
         "-p",
         "no:cacheprovider",
-        f"--junitxml={VERIFIER_JUNIT_DIR}/{junit_name}",
+        "-o",
+        "pythonpath=.",
+        *extra,
     ]
+
+
+def verifier_command(junit_name: str) -> list[str]:
+    """The one command the verifier runs. Nothing from the snapshot feeds it."""
+    return _isolated_pytest(f"--junitxml={VERIFIER_JUNIT_DIR}/{junit_name}")
+
+
+def baseline_command() -> list[str]:
+    """The pristine fixture is collected with the same isolated invocation."""
+    return _isolated_pytest("--collect-only")
 
 
 def _describe(result: SandboxResult) -> str:
@@ -165,73 +235,116 @@ def _describe(result: SandboxResult) -> str:
 # --- pristine baseline ------------------------------------------------------
 
 
+def stage_repo(source: Path) -> Path:
+    """A temporary copy of ``source`` as the repo the author was handed.
+
+    ``patches/`` and ``expectation.json`` are authoring metadata: they are
+    dropped when the author's workspace is created, so the pristine baseline is
+    staged the same way here. That is the *only* filtering the comparison gets
+    — the diff itself ignores nothing but ``_RUN_BYPRODUCTS``.
+    """
+    target = Path(tempfile.mkdtemp(prefix="ega-base-"))
+    try:
+        shutil.copytree(
+            source,
+            target,
+            symlinks=True,
+            dirs_exist_ok=True,
+            ignore=shutil.ignore_patterns(*AUTHORING_METADATA, *sorted(_RUN_BYPRODUCTS)),
+        )
+    except OSError:
+        shutil.rmtree(target, ignore_errors=True)
+        raise
+    return target
+
+
 def collect_baseline(
-    baseline_dir: Path,
+    staged_dir: Path,
     limits: Limits | None = None,
     run_id: str | None = None,
 ) -> tuple[int | None, Finding | None]:
     """Count the pristine fixture's tests in a sandbox of its own.
 
-    ``patches/`` and ``expectation.json`` are authoring metadata, not part of
-    the repo under test, so they are left out of the staging copy.
+    An unclean baseline (container error, timeout, OOM kill, any non-zero exit
+    — a collection error is exit 2) is never trusted: its count is thrown away
+    and ``BASELINE_UNAVAILABLE`` says why.
     """
-    baseline_dir = Path(baseline_dir)
-    scratch = Path(tempfile.mkdtemp(prefix="ega-baseline-"))
-    try:
-        src = scratch / "src"
-        shutil.copytree(
-            baseline_dir,
-            src,
-            symlinks=True,
-            ignore=shutil.ignore_patterns(
-                "patches", "expectation.json", "__pycache__", ".pytest_cache", ".ega"
-            ),
+    result = sandbox.run(
+        baseline_command(),
+        staged_dir,
+        limits or Limits(),
+        run_id=f"{run_id}-baseline" if run_id else None,
+        env=dict(VERIFIER_ENV),
+    )
+    shutil.rmtree(result.workdir_after, ignore_errors=True)
+    if (
+        result.error
+        or result.timed_out
+        or result.oom_killed
+        or result.exit_code != 0
+    ):
+        return None, Finding(
+            "BASELINE_UNAVAILABLE",
+            MEDIUM,
+            "the pristine fixture could not be collected cleanly, so BELOW_BASELINE "
+            "is unproven",
+            f"{_describe(result)} exit_code={result.exit_code} "
+            f"timed_out={result.timed_out} oom_killed={result.oom_killed}",
         )
-        result = sandbox.run(
-            ["python", "-m", "pytest", "-q", "-p", "no:cacheprovider", "--collect-only"],
-            src,
-            limits or Limits(),
-            run_id=f"{run_id}-baseline" if run_id else None,
+    collected = parse_collected_count(result.stdout)
+    if collected is None:
+        return None, Finding(
+            "BASELINE_UNAVAILABLE",
+            MEDIUM,
+            "the pristine fixture's collection count could not be read",
+            f"stdout_tail={(result.stdout.strip().splitlines() or ['<empty>'])[-1]!r}",
         )
-        shutil.rmtree(result.workdir_after, ignore_errors=True)
-        if result.error or result.timed_out:
-            return None, Finding(
-                "BASELINE_UNAVAILABLE",
-                MEDIUM,
-                "the pristine fixture could not be collected, so BELOW_BASELINE is unproven",
-                f"{_describe(result)} exit_code={result.exit_code}",
-            )
-        collected = parse_collected_count(result.stdout)
-        if collected is None:
-            return None, Finding(
-                "BASELINE_UNAVAILABLE",
-                MEDIUM,
-                "the pristine fixture's collection count could not be read",
-                f"stdout_tail={(result.stdout.strip().splitlines() or ['<empty>'])[-1]!r}",
-            )
-        return collected, None
-    finally:
-        shutil.rmtree(scratch, ignore_errors=True)
+    return collected, None
 
 
 # --- test harness comparison ------------------------------------------------
 
 
-def _harness_paths(root: Path) -> dict[str, Path]:
-    """Every file pytest's harness depends on, keyed by relative posix path."""
+def _is_harness_path(rel: Path) -> bool:
+    """Whether ``rel`` is a file pytest's behaviour depends on."""
+    name = rel.name
+    if name == "conftest.py" or name in HARNESS_FILE_NAMES:
+        return True
+    if _TEST_FILE_NAME.match(name):
+        return True
+    if rel.parts[0] == "tests":
+        return True
+    if name in _SHADOW_NAMES or name.endswith(_SHADOW_SUFFIXES):
+        return True
+    if any(part.endswith(_SHADOW_DIR_SUFFIXES) for part in rel.parts):
+        return True
+    if "_pytest" in rel.parts[:-1] or name == "_pytest.py":
+        return True
+    return False
+
+
+def _repo_files(root: Path) -> dict[str, Path]:
+    """Every regular file in ``root`` except run byproducts, by relative posix path."""
     found: dict[str, Path] = {}
     root = Path(root)
     for path in root.rglob("*"):
         if not path.is_file() and not path.is_symlink():
             continue
         rel = path.relative_to(root)
-        if any(part in _SKIP_DIRS for part in rel.parts):
+        if any(part in _RUN_BYPRODUCTS for part in rel.parts):
             continue
-        if rel.name == "expectation.json":
-            continue
-        if rel.parts[0] == "tests" or rel.name == "conftest.py" or rel.name in HARNESS_FILE_NAMES:
-            found[rel.as_posix()] = path
+        found[rel.as_posix()] = path
     return found
+
+
+def _harness_paths(root: Path) -> dict[str, Path]:
+    """Every file the pytest harness depends on, keyed by relative posix path."""
+    root = Path(root)
+    return {
+        rel: path
+        for rel, path in _repo_files(root).items()
+        if _is_harness_path(Path(rel))
+    }
 
 
 def _pyproject_pytest_section(path: Path | None) -> dict:
@@ -303,6 +416,82 @@ def count_xfail_markers(root: Path) -> int:
             continue
         total += len(_XFAIL_MARKER.findall(text))
     return total
+
+
+def xfail_marker_counts(baseline_dir: Path, snapshot_dir: Path) -> tuple[int, int]:
+    """``(pristine, snapshot)`` xfail markers — like for like.
+
+    Both sides are counted the same way, statically. Mixing a marker count with
+    the junit ``xfailed`` count made an untouched ``parametrize`` xfail
+    (one marker, two outcomes) look like an added one.
+    """
+    return count_xfail_markers(baseline_dir), count_xfail_markers(snapshot_dir)
+
+
+# --- product code that can forge a result -----------------------------------
+
+
+def added_lines(left_text: str, right_text: str) -> list[tuple[int, str]]:
+    """``(1-based line number in the new file, line)`` for every added line."""
+    left = left_text.splitlines()
+    right = right_text.splitlines()
+    matcher = difflib.SequenceMatcher(a=left, b=right, autojunk=False)
+    added: list[tuple[int, str]] = []
+    for tag, _i1, _i2, j1, j2 in matcher.get_opcodes():
+        if tag in ("insert", "replace"):
+            added.extend((number, right[number - 1]) for number in range(j1 + 1, j2 + 1))
+    return added
+
+
+def _product_py_files(root: Path) -> dict[str, Path]:
+    """Python files that are *not* part of the test harness, by relative path."""
+    return {
+        rel: path
+        for rel, path in _repo_files(root).items()
+        if rel.endswith(".py") and not _is_harness_path(Path(rel)) and not path.is_symlink()
+    }
+
+
+def suspicious_product_code(
+    baseline_dir: Path, snapshot_dir: Path, limit: int = 12
+) -> Finding | None:
+    """Report added product-code lines that could forge a test result.
+
+    Product code runs in the same process as pytest, so it can write the junit
+    file itself (or kill the process). That cannot be prevented from outside
+    that process; it can be spotted. A hit is a signal, not a conviction: the
+    verdict can no longer be ``done``, and the evidence carries the lines.
+    """
+    base = _product_py_files(baseline_dir)
+    snap = _product_py_files(snapshot_dir)
+    hits: list[tuple[str, int, str, str]] = []
+    for rel, path in sorted(snap.items()):
+        left = base.get(rel)
+        try:
+            left_text = (
+                left.read_text(encoding="utf-8", errors="replace") if left is not None else ""
+            )
+            right_text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for number, line in added_lines(left_text, right_text):
+            for token in SUSPICIOUS_PRODUCT_TOKENS:
+                if token in line:
+                    hits.append((rel, number, token, line.strip()))
+                    break
+    if not hits:
+        return None
+    evidence = " | ".join(
+        f"{rel}:{number}: matched {token!r} in {text[:160]!r}"
+        for rel, number, token, text in hits[:limit]
+    )
+    return Finding(
+        "SUSPICIOUS_PRODUCT_CODE",
+        HIGH,
+        f"product code added {len(hits)} line(s) that can forge a test result "
+        "(the verdict cannot be `done`)",
+        evidence[:2000],
+    )
 
 
 # --- declared artifacts -----------------------------------------------------
@@ -383,23 +572,53 @@ def verify(
         )
 
     baseline_collected: int | None = None
-    if baseline_dir is not None and run_baseline:
-        baseline_collected, baseline_finding = collect_baseline(baseline_dir, limits, run_id)
-        if baseline_finding is not None:
-            verifier_findings.append(baseline_finding)
-
+    baseline_repo: Path | None = None
     junit_name = f"junit-{uuid.uuid4().hex[:12]}.xml"
-    out_root = Path(tempfile.mkdtemp(prefix="ega-out-"))
+    out_root: Path | None = None
     workdir: Path | None = None
     kept_junit: Path | None = None
     harness_changed: list[str] = []
     try:
+        # A fresh, author-free view of the pristine fixture: the same repo the
+        # author was handed. Without it nothing about the baseline can be shown.
+        if baseline_dir is None:
+            verifier_findings.append(
+                Finding(
+                    "BASELINE_UNAVAILABLE",
+                    MEDIUM,
+                    "no pristine baseline was supplied, so the harness diff, the "
+                    "product-code check and BELOW_BASELINE could not run",
+                    "baseline_dir=None",
+                )
+            )
+        else:
+            try:
+                baseline_repo = stage_repo(baseline_dir)
+            except OSError as exc:
+                verifier_findings.append(
+                    Finding(
+                        "BASELINE_UNAVAILABLE",
+                        MEDIUM,
+                        "the pristine baseline could not be staged for comparison",
+                        f"baseline_dir={baseline_dir} error={exc}",
+                    )
+                )
+
+        if baseline_repo is not None and run_baseline:
+            baseline_collected, baseline_finding = collect_baseline(
+                baseline_repo, limits, run_id
+            )
+            if baseline_finding is not None:
+                verifier_findings.append(baseline_finding)
+
+        out_root = Path(tempfile.mkdtemp(prefix="ega-out-"))
         started = time.time()
         result = sandbox.run(
             verifier_command(junit_name),
             snapshot_dir,
             limits or Limits(),
             run_id=run_id,
+            env=dict(VERIFIER_ENV),
             out_dir=out_root,
         )
         workdir = result.workdir_after
@@ -434,8 +653,8 @@ def verify(
                 )
 
         # The test harness itself must be the one the fixture shipped.
-        if baseline_dir is not None:
-            changes = harness_changes(baseline_dir, snapshot_dir)
+        if baseline_repo is not None:
+            changes = harness_changes(baseline_repo, snapshot_dir)
             harness_changed = [rel for rel, _ in changes]
             if changes:
                 verifier_findings.append(
@@ -447,8 +666,9 @@ def verify(
                         " | ".join(f"{rel}: {diff[:400]}" for rel, diff in changes)[:2000],
                     )
                 )
-            pristine_xfail = count_xfail_markers(baseline_dir)
-            snapshot_xfail = max(count_xfail_markers(snapshot_dir), report.counts["xfailed"])
+            pristine_xfail, snapshot_xfail = xfail_marker_counts(
+                baseline_repo, snapshot_dir
+            )
             if snapshot_xfail > pristine_xfail:
                 verifier_findings.append(
                     Finding(
@@ -474,6 +694,9 @@ def verify(
                         f"baseline={baseline_collected}",
                     )
                 )
+            product_finding = suspicious_product_code(baseline_repo, snapshot_dir)
+            if product_finding is not None:
+                verifier_findings.append(product_finding)
 
         # Anything the container left behind that cannot be copied out safely.
         if result.excluded_output:
@@ -562,7 +785,10 @@ def verify(
             harness_changes=harness_changed,
         )
     finally:
-        # The verifier owns both temp trees; neither outlives the call.
+        # The verifier owns every temp tree it made; none outlives the call.
         if workdir is not None:
             shutil.rmtree(workdir, ignore_errors=True)
-        shutil.rmtree(out_root, ignore_errors=True)
+        if out_root is not None:
+            shutil.rmtree(out_root, ignore_errors=True)
+        if baseline_repo is not None:
+            shutil.rmtree(baseline_repo, ignore_errors=True)

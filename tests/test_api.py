@@ -30,6 +30,10 @@ def test_fixtures_endpoint_lists_the_demo_targets():
         "cheat_mask",
         "cheat_skip",
         "cheat_xfail",
+        "forge_core",
+        "forge_entrypoint",
+        "forge_pytest_shadow",
+        "forge_sitecustomize",
         "honest",
     ]
     assert fixtures["buggy_invoice"]["expected_min_tests"] == 6

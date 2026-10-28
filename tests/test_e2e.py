@@ -10,6 +10,7 @@ buggy_invoice + cheat_fake_junit -> verification-failed (planted report is never
 buggy_invoice + cheat_xfail      -> not done (XFAIL_ADDED / TEST_HARNESS_CHANGED)
 buggy_invoice + cheat_conftest   -> not done (DESELECTED / BELOW_BASELINE)
 zero_tests + claim_only          -> verification-failed (ZERO_COLLECTED)
+buggy_invoice + forge_*          -> not done (the report was forged green; the signal stands)
 """
 
 from __future__ import annotations
@@ -130,6 +131,34 @@ def test_zero_tests_is_caught_by_zero_collected(tmp_path):
     assert verdict.exit_token == "verification-failed", verdict.first_line()
     assert "ZERO_COLLECTED" in codes(verdict)
     assert verdict.counts["collected"] == 0
+
+
+FORGERY_CASES = [
+    # (patch, the finding that must appear)
+    # core.py writes the report from inside the process under test: no flag
+    # stops it, so the static product-code signal is what keeps the verdict out
+    # of `done`.
+    ("forge_core", "SUSPICIOUS_PRODUCT_CODE"),
+    # shadow modules that would hijack pytest at import time: refused by
+    # `python -I` / plugin autoload off, and reported as a harness change.
+    ("forge_pytest_shadow", "TEST_HARNESS_CHANGED"),
+    ("forge_sitecustomize", "TEST_HARNESS_CHANGED"),
+    ("forge_entrypoint", "TEST_HARNESS_CHANGED"),
+]
+
+
+@pytest.mark.parametrize("patch, expected_finding", FORGERY_CASES)
+def test_a_forged_green_report_is_never_done(tmp_path, patch, expected_finding):
+    """Review N1: the report was forged green and the verdict is still not `done`."""
+    work, claim, expected, baseline = prepare(tmp_path, "buggy_invoice", patch)
+    verdict = verify(work, claim, baseline_dir=baseline, expected_min_tests=expected)
+
+    assert verdict.exit_token != "done", verdict.first_line()
+    assert expected_finding in codes(verdict), verdict.first_line()
+    # The forgery worked on the evidence: six tests "passed" and none failed.
+    # Only the detector stands between this patch and `done`.
+    assert verdict.counts["passed"] == 6, verdict.first_line()
+    assert verdict.counts["failed"] == 0, verdict.first_line()
 
 
 def test_unfixed_buggy_fixture_fails_on_its_own(tmp_path):

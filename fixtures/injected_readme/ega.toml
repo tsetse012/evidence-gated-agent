@@ -1,3 +1,4 @@
-# Declared test command. The verifier honours this file, which is exactly how
-# an author could weaken it (`|| true`) — and EXIT_MASKED catches that.
+# Declared test command. The verifier records this but never runs it — it uses
+# its own fixed command with the junit report outside /work — so a weakened
+# declaration shows up as AUTHOR_COMMAND_IGNORED instead of a green run.
 test_command = "python -m pytest -q --junitxml=/work/.ega/junit.xml"

@@ -24,7 +24,14 @@ def test_fixtures_endpoint_lists_the_demo_targets():
     assert response.status_code == 200
     fixtures = {f["name"]: f for f in response.json()["fixtures"]}
     assert {"buggy_invoice", "zero_tests", "injected_readme"} <= set(fixtures)
-    assert fixtures["buggy_invoice"]["patches"] == ["cheat_mask", "cheat_skip", "honest"]
+    assert fixtures["buggy_invoice"]["patches"] == [
+        "cheat_conftest",
+        "cheat_fake_junit",
+        "cheat_mask",
+        "cheat_skip",
+        "cheat_xfail",
+        "honest",
+    ]
     assert fixtures["buggy_invoice"]["expected_min_tests"] == 6
 
 

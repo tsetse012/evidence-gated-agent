@@ -6,10 +6,12 @@ exit code, OOMKilled), never from what we expected.
 
 from __future__ import annotations
 
+import errno
 import json
 import os
+import shutil
 import tempfile
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 from . import sandbox
@@ -18,12 +20,11 @@ from .sandbox import Limits, SandboxResult
 FAKE_SECRET_ENV = "EGA_FAKE_SECRET_TOKEN"
 FAKE_SECRET_VALUE = "ega-fake-secret-DO-NOT-LEAK-9f3a"
 
-# Keys baked into the *image* that match KEY|TOKEN|SECRET|PASSWORD but are
-# public metadata, not secrets (the python base image ships a public OpenPGP
-# fingerprint). They are reported in the evidence as "excluded", never hidden,
-# and this allowlist is deliberately tiny: anything else matching the pattern
-# still fails the probe.
-BASE_IMAGE_METADATA_KEYS = frozenset({"GPG_KEY"})
+# A KEY-shaped variable is only suspicious when it carries a value. The
+# `python:*` base image ships a public OpenPGP fingerprint in GPG_KEY, and the
+# sandbox runner blanks it (`sandbox.BASE_CONTAINER_ENV`) instead of the probe
+# excusing the *name* — a name-based allowlist would also excuse a real secret
+# that happened to use that name.
 
 PROBE_LIMITS = Limits(memory="256m", cpus=1.0, pids_limit=128, timeout_s=90)
 
@@ -63,10 +64,16 @@ def _tail(text: str, limit: int = 240) -> str:
 
 
 def _run_script(script: str, limits: Limits) -> tuple[SandboxResult, dict | None]:
+    """Run one probe script; neither the source nor the result tree outlives it."""
     src = Path(tempfile.mkdtemp(prefix="ega-probe-"))
-    (src / "probe.py").write_text(script, encoding="utf-8")
-    result = sandbox.run(["python", "-I", "/work/probe.py"], src, limits)
-    return result, _payload(result)
+    try:
+        (src / "probe.py").write_text(script, encoding="utf-8")
+        result = sandbox.run(["python", "-I", "/work/probe.py"], src, limits)
+        payload = _payload(result)
+    finally:
+        shutil.rmtree(src, ignore_errors=True)
+    shutil.rmtree(result.workdir_after, ignore_errors=True)
+    return result, payload
 
 
 # --- probe scripts (each prints one EGA_RESULT json line) -------------------
@@ -121,13 +128,14 @@ print("EGA_RESULT " + json.dumps({"attempts": attempts}))
 
 FORK_SCRIPT = """\
 import json, os
-children, failure, attempts = [], None, 0
+children, failure, failure_errno, attempts = [], None, None, 0
 for _ in range(400):
     attempts += 1
     try:
         pid = os.fork()
     except OSError as exc:
         failure = f"{type(exc).__name__}: {exc}"
+        failure_errno = exc.errno
         break
     if pid == 0:
         os._exit(0)
@@ -138,7 +146,7 @@ for pid in children:
     except OSError:
         pass
 print("EGA_RESULT " + json.dumps({"attempts": attempts, "children": len(children),
-                                  "failure": failure}))
+                                  "failure": failure, "failure_errno": failure_errno}))
 """
 
 MEMORY_SCRIPT = """\
@@ -160,10 +168,13 @@ import json, os, re
 fake = {fake!r}
 pattern = re.compile(r"KEY|TOKEN|SECRET|PASSWORD", re.IGNORECASE)
 env = dict(os.environ)
-suspects = sorted(k for k in env if pattern.search(k))
+named = sorted(k for k in env if pattern.search(k))
+suspects = sorted(k for k in named if env[k])
+empty = sorted(k for k in named if not env[k])
 fake_seen = sorted(k for k, v in env.items() if v == fake)
 print("EGA_RESULT " + json.dumps({{"env_count": len(env), "keys": sorted(env),
-                                   "suspects": suspects, "fake_seen": fake_seen}}))
+                                   "suspects": suspects, "empty_keys": empty,
+                                   "fake_seen": fake_seen}}))
 """
 
 
@@ -231,6 +242,52 @@ def probe_write_outside_workspace(limits: Limits = PROBE_LIMITS) -> ProbeResult:
     )
 
 
+def fork_verdict(
+    children: int,
+    failure: str | None,
+    failure_errno: int | None,
+    pids_limit: int,
+) -> tuple[bool, bool, str]:
+    """``(blocked, reached, why)`` for one fork-bomb observation.
+
+    The pids cgroup reports EAGAIN/BlockingIOError ("Resource temporarily
+    unavailable"). Any other OSError, or a run that never approached the cap,
+    is not evidence that the limit did the blocking.
+    """
+    eagain = failure_errno == errno.EAGAIN or bool(
+        failure
+        and (
+            "EAGAIN" in failure
+            or "BlockingIOError" in failure
+            or "Resource temporarily unavailable" in failure
+        )
+    )
+    threshold = int(pids_limit * 0.5)
+    reached = children >= threshold
+    blocked = bool(eagain and reached)
+    if blocked:
+        return True, reached, "ok"
+    if eagain and not reached:
+        return False, reached, f"EAGAIN at {children} children, below the {threshold} threshold"
+    if reached and not eagain:
+        return False, reached, f"failure was {failure!r}, not a pids-limit EAGAIN"
+    return False, reached, f"only {children} children and no EAGAIN failure ({failure!r})"
+
+
+def memory_verdict(
+    oom_killed: bool, memory_error: bool, exit_code: int
+) -> tuple[bool, str]:
+    """``(blocked, why)`` — only a kernel OOM kill or a MemoryError proves it."""
+    if oom_killed:
+        return True, "oom_killed=True"
+    if memory_error:
+        return True, "MemoryError"
+    return (
+        False,
+        f"exit_code={exit_code} but no OOMKilled flag and no MemoryError",
+    )
+
+
 def probe_fork_bomb(limits: Limits = PROBE_LIMITS) -> ProbeResult:
     result, payload = _run_script(FORK_SCRIPT, limits)
     if result.error or payload is None:
@@ -239,12 +296,18 @@ def probe_fork_bomb(limits: Limits = PROBE_LIMITS) -> ProbeResult:
             f"sandbox error: {result.error or 'probe produced no result'} "
             f"exit={result.exit_code} stderr={_tail(result.stderr)}",
         )
-    capped = payload["failure"] is not None
-    evidence = (
-        f"attempts={payload['attempts']} children={payload['children']} "
-        f"pids_limit={limits.pids_limit} failure={payload['failure']} [exit={result.exit_code}]"
+    children = payload["children"]
+    failure = payload["failure"]
+    blocked, reached, why = fork_verdict(
+        children, failure, payload.get("failure_errno"), limits.pids_limit
     )
-    return ProbeResult("fork_bomb", True, capped, evidence)
+    evidence = (
+        f"attempts={payload['attempts']} children={children} "
+        f"pids_limit={limits.pids_limit} reached={reached} "
+        f"eagain={blocked or 'EAGAIN' in (failure or '')} failure={failure} "
+        f"why={why} [exit={result.exit_code}]"
+    )
+    return ProbeResult("fork_bomb", True, blocked, evidence)
 
 
 def probe_memory_hog(limits: Limits = PROBE_LIMITS) -> ProbeResult:
@@ -254,22 +317,26 @@ def probe_memory_hog(limits: Limits = PROBE_LIMITS) -> ProbeResult:
             "memory_hog", True, False,
             f"sandbox error: {result.error} exit={result.exit_code} stderr={_tail(result.stderr)}",
         )
-    killed = result.oom_killed or result.exit_code == 137 or result.exit_code == -9
     memory_error = bool(payload and payload.get("error"))
     allocated = payload["allocated_mb"] if payload else "unknown"
-    if killed:
+    blocked, why = memory_verdict(result.oom_killed, memory_error, result.exit_code)
+    if result.oom_killed:
         evidence = (
-            f"process killed after allocating {allocated} MB: exit_code={result.exit_code} "
-            f"oom_killed={result.oom_killed} memory_limit={limits.memory}"
+            f"OOM-killed after allocating {allocated} MB: exit_code={result.exit_code} "
+            f"oom_killed=True memory_limit={limits.memory}"
         )
     elif memory_error:
-        evidence = f"MemoryError after allocating {allocated} MB: {payload['error']} [exit={result.exit_code}]"
+        evidence = (
+            f"MemoryError after allocating {allocated} MB: {payload['error']} "
+            f"[exit={result.exit_code}]"
+        )
     else:
         evidence = (
-            f"allocated {allocated} MB without being stopped "
-            f"(memory_limit={limits.memory}) [exit={result.exit_code}]"
+            f"allocated {allocated} MB without a proven cap (memory_limit={limits.memory}): "
+            f"exit_code={result.exit_code} oom_killed={result.oom_killed} "
+            f"memory_error={memory_error}"
         )
-    return ProbeResult("memory_hog", True, killed or memory_error, evidence)
+    return ProbeResult("memory_hog", True, blocked, f"{evidence} why={why}")
 
 
 def probe_env_leak(limits: Limits = PROBE_LIMITS) -> ProbeResult:
@@ -282,12 +349,11 @@ def probe_env_leak(limits: Limits = PROBE_LIMITS) -> ProbeResult:
             f"sandbox error: {result.error or 'probe produced no result'} "
             f"exit={result.exit_code} stderr={_tail(result.stderr)}",
         )
-    excluded = [k for k in payload["suspects"] if k in BASE_IMAGE_METADATA_KEYS]
-    suspicious = [k for k in payload["suspects"] if k not in BASE_IMAGE_METADATA_KEYS]
+    suspicious = payload["suspects"]
     return ProbeResult(
         "env_leak", True, not (suspicious or payload["fake_seen"]),
         f"env_count={payload['env_count']} keys={payload['keys']} "
-        f"suspicious_keys={suspicious} excluded_base_image_keys={excluded} "
+        f"suspicious_keys={suspicious} empty_keys={payload['empty_keys']} "
         f"fake_token_seen={payload['fake_seen']} "
         f"host_{FAKE_SECRET_ENV}_seeded={FAKE_SECRET_VALUE!r}",
     )

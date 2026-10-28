@@ -50,6 +50,37 @@ def test_firewall_and_service_units_are_present():
     assert "/etc/caddy/Caddyfile" in text
 
 
+def test_the_service_runs_as_the_dedicated_non_root_user():
+    """Review #4: the API ran as root and therefore as root next to the socket."""
+    data = load_cloud_init()
+    unit = next(
+        f for f in data["write_files"] if f["path"] == "/etc/systemd/system/ega.service"
+    )["content"]
+    assert "User=ega" in unit
+    assert "Group=ega" in unit
+    assert "SupplementaryGroups=docker" in unit
+    assert "User=root" not in unit
+
+
+def test_the_service_user_is_created_without_sudo_and_jointed_to_docker():
+    text = (INFRA / "cloud-init.yaml").read_text(encoding="utf-8")
+    assert "useradd" in text and "ega" in text
+    assert "usermod -aG docker ega" in text
+    assert "NOPASSWD" not in text
+
+
+def test_the_app_is_owned_and_built_by_the_service_user():
+    text = (INFRA / "cloud-init.yaml").read_text(encoding="utf-8")
+    assert "chown -R ega:ega /opt/evidence-gated-agent" in text
+    assert "su ega -s /bin/bash -c 'cd /opt/evidence-gated-agent && ./scripts/build_image.sh'" in text
+    assert "uv sync --frozen" in text
+
+
+def test_the_runs_directory_belongs_to_the_service_user():
+    text = (INFRA / "cloud-init.yaml").read_text(encoding="utf-8")
+    assert "chown -R ega:ega /var/lib/ega" in text
+
+
 def test_no_placeholder_secrets_are_committed():
     text = (INFRA / "cloud-init.yaml").read_text(encoding="utf-8")
     assert not re.search(r"(AKIA|sk-[A-Za-z0-9]{16,}|BEGIN [A-Z ]*PRIVATE KEY)", text)

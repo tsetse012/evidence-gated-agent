@@ -9,6 +9,7 @@ from ega.evidence import (
     Finding,
     analyze,
     empty_counts,
+    parse_collected_count,
     parse_junit,
     parse_stdout_summary,
     verdict_token,
@@ -60,6 +61,113 @@ def test_parse_stdout_summary_reads_pytest_line():
 
 def test_parse_stdout_summary_without_summary_is_empty():
     assert parse_stdout_summary("collected 0 items\n") == {}
+
+
+def test_parse_stdout_summary_handles_the_decorated_form():
+    """Normal verbosity wraps the same line in ``=====``."""
+    line = "========== 2 failed, 4 passed in 0.05s ==========\n"
+    assert parse_stdout_summary(line) == {"failed": 2, "passed": 4}
+
+
+def test_parse_stdout_summary_handles_ansi_colours():
+    line = "\x1b[31m===== 1 failed, 3 passed in 0.10s =====\x1b[0m\n"
+    assert parse_stdout_summary(line) == {"failed": 1, "passed": 3}
+
+
+def test_parse_stdout_summary_reads_deselected():
+    """`deselected` is a real summary key; it used to raise KeyError."""
+    assert parse_stdout_summary("4 passed, 2 deselected in 0.05s\n") == {
+        "passed": 4,
+        "deselected": 2,
+    }
+
+
+def test_parse_stdout_summary_reads_xfail_and_skip():
+    line = "4 passed, 2 xfailed, 1 skipped in 0.05s\n"
+    assert parse_stdout_summary(line) == {"passed": 4, "xfailed": 2, "skipped": 1}
+
+
+# --- DESELECTED ------------------------------------------------------------
+
+
+def test_deselected_positive(tmp_path):
+    path = tmp_path / "junit.xml"
+    path.write_text(junit("pass", "pass", "pass", "pass"), encoding="utf-8")
+    report = analyze(
+        stdout="4 passed, 2 deselected in 0.05s", stderr="", exit_code=0, junit_path=path
+    )
+    assert "DESELECTED" in codes(report)
+    assert "DESELECTED" not in codes(
+        analyze(
+            stdout="4 passed in 0.05s", stderr="", exit_code=0, junit_path=path
+        )
+    )
+
+
+# --- TESTS_FAILED ----------------------------------------------------------
+
+
+def test_tests_failed_is_reported_even_when_the_exit_code_was_masked(tmp_path):
+    path = tmp_path / "junit.xml"
+    path.write_text(junit("pass", "fail", "fail"), encoding="utf-8")
+    report = analyze(
+        stdout="2 failed, 1 passed in 0.05s", stderr="", exit_code=0, junit_path=path
+    )
+    assert "TESTS_FAILED" in codes(report)
+
+
+def test_tests_failed_is_not_reported_for_a_green_run(tmp_path):
+    path = tmp_path / "junit.xml"
+    path.write_text(junit("pass", "pass"), encoding="utf-8")
+    report = analyze(stdout="2 passed in 0.05s", stderr="", exit_code=0, junit_path=path)
+    assert "TESTS_FAILED" not in codes(report)
+    assert verdict_token(counts=report.counts, findings=report.findings) == "done"
+
+
+# --- NONZERO_EXIT / OOM_KILLED ---------------------------------------------
+
+
+def test_nonzero_exit_is_not_done_even_with_a_green_report(tmp_path):
+    path = tmp_path / "junit.xml"
+    path.write_text(junit("pass", "pass"), encoding="utf-8")
+    report = analyze(
+        stdout="2 passed in 0.05s", stderr="fatal: internal error", exit_code=1, junit_path=path
+    )
+    assert "NONZERO_EXIT" in codes(report)
+    assert verdict_token(counts=report.counts, findings=report.findings) != "done"
+
+
+def test_oom_killed_is_not_done(tmp_path):
+    path = tmp_path / "junit.xml"
+    path.write_text(junit("pass", "pass"), encoding="utf-8")
+    report = analyze(
+        stdout="", stderr="", exit_code=137, junit_path=path, oom_killed=True
+    )
+    assert "OOM_KILLED" in codes(report)
+    assert verdict_token(counts=report.counts, findings=report.findings) != "done"
+
+
+def test_oom_killed_absent_by_default(tmp_path):
+    path = tmp_path / "junit.xml"
+    path.write_text(junit("pass"), encoding="utf-8")
+    report = analyze(stdout="1 passed in 0.01s", stderr="", exit_code=0, junit_path=path)
+    assert "OOM_KILLED" not in codes(report)
+
+
+# --- parse_collected_count -------------------------------------------------
+
+
+def test_parse_collected_count_reads_the_summary_line():
+    assert parse_collected_count("../../tests/test_a.py::test_x\n\n6 tests collected in 0.02s\n") == 6
+
+
+def test_parse_collected_count_reads_zero():
+    assert parse_collected_count("no tests collected in 0.01s\n") == 0
+
+
+def test_parse_collected_count_returns_none_when_it_cannot_tell():
+    """None is not 0: an unreadable baseline must not look like an empty suite."""
+    assert parse_collected_count("something unexpected\n") is None
 
 
 # --- ZERO_COLLECTED --------------------------------------------------------

@@ -41,6 +41,10 @@ write_files:
 
       [Service]
       Type=simple
+      # Never root: the service only needs to talk to the docker socket.
+      User=ega
+      Group=ega
+      SupplementaryGroups=docker
       WorkingDirectory=/opt/evidence-gated-agent
       Environment=EGA_RUNS_DIR=/var/lib/ega/runs
       Environment=EGA_RUNTIME=runsc
@@ -86,12 +90,17 @@ runcmd:
   - ufw allow 443/tcp
   - ufw --force enable
 
-  # --- app ---
+  # --- dedicated non-root service user (docker group only, no sudo) ---
+  - id -u ega >/dev/null 2>&1 || useradd --create-home --shell /usr/sbin/nologin ega
+  - usermod -aG docker ega
+
+  # --- app: owned and built by the service user, never by root ---
   - git clone https://github.com/REPLACE_ME/evidence-gated-agent.git /opt/evidence-gated-agent
-  - cd /opt/evidence-gated-agent && curl -LsSf https://astral.sh/uv/install.sh | sh
-  - cd /opt/evidence-gated-agent && /root/.local/bin/uv sync --frozen
-  - cd /opt/evidence-gated-agent && ./scripts/build_image.sh
-  - mkdir -p /var/lib/ega/runs && chmod 0755 /var/lib/ega/runs
+  - chown -R ega:ega /opt/evidence-gated-agent
+  - su ega -s /bin/bash -c 'curl -LsSf https://astral.sh/uv/install.sh | sh'
+  - su ega -s /bin/bash -c 'cd /opt/evidence-gated-agent && /home/ega/.local/bin/uv sync --frozen'
+  - su ega -s /bin/bash -c 'cd /opt/evidence-gated-agent && ./scripts/build_image.sh'
+  - mkdir -p /var/lib/ega/runs && chown -R ega:ega /var/lib/ega && chmod 0755 /var/lib/ega/runs
 
   # --- Caddy (automatic TLS when a domain is set) ---
   - curl -1sLf https://dl.cloudsmith.io/public/caddy/stable/gpg.key | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg

@@ -20,8 +20,12 @@ WARNING = "warning"
 
 COUNT_KEYS = ("collected", "passed", "failed", "errors", "skipped", "xfailed", "xpassed")
 
-# pytest's final summary line, e.g. "2 failed, 4 passed in 0.05s"
-_SUMMARY_TAIL = re.compile(r"\bin \d+\.\d+s\s*$")
+# pytest's final summary line, e.g. "2 failed, 4 passed in 0.05s". The same
+# line is printed with heavy decoration at normal verbosity
+# ("========== 2 failed, 4 passed in 0.05s =========="), possibly wrapped in
+# ANSI colour codes, so both are normalised before parsing.
+_SUMMARY_TAIL = re.compile(r"\bin \d+\.\d+s\b")
+_ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 _SUMMARY_PAIR = re.compile(
     r"(\d+) (passed|failed|errors?|skipped|xfailed|xpassed|deselected)"
 )
@@ -33,7 +37,10 @@ _SUMMARY_KEY = {
     "skipped": "skipped",
     "xfailed": "xfailed",
     "xpassed": "xpassed",
+    "deselected": "deselected",
 }
+# "6 tests collected in 0.05s" / "no tests collected in 0.01s"
+_COLLECTED_LINE = re.compile(r"^(?:(\d+)|no)\s+tests?\s+collected\b", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -105,15 +112,23 @@ def parse_junit(xml_text: str) -> dict[str, int]:
     return counts
 
 
+def _normalise(line: str) -> str:
+    """Strip ANSI colours and pytest's ``=====`` decoration from a line."""
+    return _ANSI.sub("", line).strip("= \t").strip()
+
+
 def parse_stdout_summary(stdout: str) -> dict[str, int]:
     """Return the counts printed on pytest's last summary line.
 
-    Empty dict when no summary line can be found (e.g. the process died).
+    Handles the plain ``-q`` form and the decorated normal-verbosity form
+    (``===== 2 failed, 4 passed in 0.05s =====``) and ANSI colour codes. Empty
+    dict when no summary line can be found (e.g. the process died).
     """
     summary_line = ""
     for line in stdout.splitlines():
-        if _SUMMARY_TAIL.search(line):
-            summary_line = line
+        clean = _normalise(line)
+        if _SUMMARY_TAIL.search(clean):
+            summary_line = clean
     if not summary_line:
         return {}
     found: dict[str, int] = {}
@@ -121,6 +136,23 @@ def parse_stdout_summary(stdout: str) -> dict[str, int]:
         key = _SUMMARY_KEY[raw_key]
         found[key] = int(raw_count)
     return found
+
+
+def parse_collected_count(stdout: str) -> int | None:
+    """How many tests a ``pytest --collect-only -q`` run collected.
+
+    ``None`` means "could not tell" — which is different from ``0``
+    ("no tests collected") and must never be treated as a green baseline.
+    """
+    lines = [_normalise(line) for line in stdout.splitlines()]
+    for line in reversed(lines):
+        match = _COLLECTED_LINE.match(line)
+        if match:
+            return int(match.group(1)) if match.group(1) is not None else 0
+    node_ids = [line for line in stdout.splitlines() if "::" in line]
+    if node_ids:
+        return len(node_ids)
+    return None
 
 
 def analyze(
@@ -133,6 +165,7 @@ def analyze(
     skip_ratio_threshold: float = 0.2,
     artifacts: Sequence[Path] = (),
     run_started: float | None = None,
+    oom_killed: bool = False,
 ) -> EvidenceReport:
     """Run every detector over one verifier run."""
     findings: list[Finding] = []
@@ -269,6 +302,60 @@ def analyze(
                     f"{path} mtime={stat.st_mtime:.0f} < run_start={run_started:.0f}",
                 )
             )
+
+    # TESTS_FAILED — the run's actual result, independent of how the command
+    # exited or what the command was allowed to mask.
+    if counts["failed"] or counts["errors"]:
+        findings.append(
+            Finding(
+                "TESTS_FAILED",
+                CRITICAL,
+                f"{counts['failed']} test(s) failed and {counts['errors']} errored; "
+                "failing tests are never proof",
+                f"failed={counts['failed']} errors={counts['errors']} "
+                f"exit_code={exit_code}",
+            )
+        )
+
+    # NONZERO_EXIT — the run did not complete successfully, whatever the report
+    # says. A green report attached to a failed process proves nothing.
+    if exit_code != 0:
+        findings.append(
+            Finding(
+                "NONZERO_EXIT",
+                CRITICAL,
+                f"the test process exited {exit_code}; a run that did not finish "
+                "successfully cannot prove the claim",
+                f"exit_code={exit_code} junit_present={bool(junit_text)} "
+                f"stderr_tail={(stderr.strip().splitlines() or ['<empty>'])[-1]!r}",
+            )
+        )
+
+    # OOM_KILLED — the process was killed by the kernel, so the suite never
+    # reached its own conclusion.
+    if oom_killed:
+        findings.append(
+            Finding(
+                "OOM_KILLED",
+                CRITICAL,
+                "the test process was OOM-killed; the run did not complete",
+                f"oom_killed=True exit_code={exit_code} "
+                f"stdout_tail={(stdout.strip().splitlines() or ['<empty>'])[-1]!r}",
+            )
+        )
+
+    # DESELECTED — tests were removed from the run without being marked in the
+    # source, which also makes the count comparison meaningless.
+    deselected = summary.get("deselected", 0)
+    if deselected > 0:
+        findings.append(
+            Finding(
+                "DESELECTED",
+                MEDIUM,
+                f"{deselected} test(s) were deselected; the run does not cover the suite",
+                f"deselected={deselected} summary={summary}",
+            )
+        )
 
     return EvidenceReport(counts=counts, findings=findings)
 

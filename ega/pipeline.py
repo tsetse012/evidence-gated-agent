@@ -136,19 +136,20 @@ def run_pipeline(
         shutil.copytree(author_dir, snapshot_dir)
 
         # Sandbox B: a brand-new container, given only the snapshot + the claim.
+        # The pristine fixture is the baseline the verifier compares against;
+        # the junit report is written outside the workspace and kept here.
+        verify_junit = run_dir / "verify_junit.xml"
         verdict = verify(
             snapshot_dir,
             claim,
+            baseline_dir=fixture_dir,
             expected_min_tests=meta.get("expected_min_tests"),
             limits=limits,
             run_id=f"{run_id}-b",
+            junit_keep_path=verify_junit,
         )
         # Keep the junit report inside the run dir so the trace stays auditable.
         verdict_data = verdict.as_dict()
-        if verdict.junit_path is not None:
-            saved = run_dir / "verify_junit.xml"
-            shutil.copyfile(verdict.junit_path, saved)
-            verdict_data["junit_path"] = str(saved)
         trace.append(
             "verify",
             inputs={

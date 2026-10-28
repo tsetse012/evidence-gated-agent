@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 # The project's own gate: build the image, run the whole suite, print counts,
 # and refuse to be a false green (see SPEC §10).
+#
+# PYTEST_ADDOPTS is unset for every pytest call: an outside `-k`/`-m` filter
+# would otherwise shrink the run and still look green. The required node ids in
+# scripts/expected_tests.txt are then checked against the junit reports.
 set -uo pipefail
 
 cd "$(dirname "$0")/.."
@@ -14,14 +18,14 @@ fi
 
 echo
 echo "== [2/4] full pytest =="
-uv run pytest -q --junitxml=runs/check-junit.xml 2>&1 | tee runs/check.log
+env -u PYTEST_ADDOPTS uv run pytest -q --junitxml=runs/check-junit.xml 2>&1 | tee runs/check.log
 pytest_status=${PIPESTATUS[0]}
 echo "pytest exit status: ${pytest_status}"
 
 echo
 echo "== [3/4] docker-marked pytest =="
 if docker info --format '{{.ServerVersion}}' >/dev/null 2>&1; then
-  uv run pytest -q -m docker --junitxml=runs/check-docker-junit.xml 2>&1 | tee runs/check-docker.log
+  env -u PYTEST_ADDOPTS uv run pytest -q -m docker --junitxml=runs/check-docker-junit.xml 2>&1 | tee runs/check-docker.log
   docker_status=${PIPESTATUS[0]}
   echo "docker-marked pytest exit status: ${docker_status}"
   docker_junit=runs/check-docker-junit.xml
@@ -32,16 +36,18 @@ else
 fi
 
 echo
-echo "== [4/4] counts gate =="
+echo "== [4/4] counts + required node ids gate =="
 if [ -n "${docker_junit}" ]; then
   uv run python scripts/check_counts.py \
     --junit runs/check-junit.xml \
     --pytest-status "${pytest_status}" \
-    --docker-junit "${docker_junit}"
+    --docker-junit "${docker_junit}" \
+    --expected-tests scripts/expected_tests.txt
 else
   uv run python scripts/check_counts.py \
     --junit runs/check-junit.xml \
-    --pytest-status "${pytest_status}"
+    --pytest-status "${pytest_status}" \
+    --expected-tests scripts/expected_tests.txt
 fi
 gate_status=$?
 

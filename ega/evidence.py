@@ -49,14 +49,21 @@ class Finding:
     severity: str
     message: str
     evidence: str
+    # True when ``evidence`` is a prefix of what the detector collected. A
+    # partial verdict is approved by a human reading that evidence, so the
+    # approval gate refuses a finding whose evidence was cut (``pipeline.approve``).
+    truncated: bool = False
 
     def as_dict(self) -> dict:
-        return {
+        data = {
             "code": self.code,
             "severity": self.severity,
             "message": self.message,
             "evidence": self.evidence,
         }
+        if self.truncated:
+            data["truncated"] = True
+        return data
 
 
 @dataclass
@@ -161,6 +168,10 @@ def node_outcomes(junit_path: Path | None) -> dict[str, str]:
     An unreadable or missing report is an empty mapping (never an exception):
     the caller decides what an unreadable baseline means, and that is never
     "no changes".
+
+    Two testcases can rebuild to the same node id (``tests/a.py::B::test_x``
+    and ``tests/a/B.py::test_x``); the later one wins here, so a caller that
+    needs every node must check :func:`duplicate_node_ids` first.
     """
     if junit_path is None:
         return {}
@@ -177,6 +188,30 @@ def node_outcomes(junit_path: Path | None) -> dict[str, str]:
         if node:
             outcomes[node] = _case_outcome(case)
     return outcomes
+
+
+def duplicate_node_ids(junit_path: Path | None) -> list[str]:
+    """Node ids that more than one ``testcase`` maps onto.
+
+    ``node_id_for_case`` is lossy for dotted class names, so two distinct tests
+    can collapse onto one key. A node-by-node comparison built on such a report
+    silently drops one of them — the baseline is unusable, not merely odd.
+    """
+    if junit_path is None:
+        return []
+    path = Path(junit_path)
+    if not path.is_file():
+        return []
+    try:
+        root = ET.parse(path).getroot()
+    except (ET.ParseError, OSError):
+        return []
+    seen: dict[str, int] = {}
+    for case in root.iter("testcase"):
+        node = node_id_for_case(case.get("classname") or "", case.get("name") or "")
+        if node:
+            seen[node] = seen.get(node, 0) + 1
+    return sorted(node for node, count in seen.items() if count > 1)
 
 
 def node_ids(junit_path: Path | None, *, passed_only: bool = True) -> set[str]:

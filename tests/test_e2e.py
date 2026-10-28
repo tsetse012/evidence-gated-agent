@@ -240,6 +240,197 @@ def test_an_honest_added_test_is_partial(tmp_path):
     assert verdict.counts["passed"] == 7
 
 
+# --- review fix4: additions-only, decided on the source --------------------
+
+TEST_MODULE = "tests/test_invoice.py"
+HONEST_CORE = FIXTURES / "buggy_invoice" / "patches" / "honest" / "files" / "invoice" / "core.py"
+# Genuinely new tests, so every case below appends something the rule allows;
+# the cheat is the statement that follows it.
+PADDING = "".join(
+    f'\n\ndef test_padding_regression_{i}():\n'
+    f'    """Regression coverage for subtotal edge case {i}."""\n'
+    f"    assert invoice.subtotal([({i}.0, 1)]) == {i}.0\n"
+    for i in range(3)
+)
+
+
+def append_to_module(text, *, padding=True):
+    def mutate(work: Path) -> None:
+        module = work / TEST_MODULE
+        module.write_text(module.read_text() + (PADDING if padding else "") + text)
+
+    return mutate
+
+
+def swap_import_for_a_shim(work: Path) -> None:
+    """c6: the module imports a different module under the name it already used."""
+    (work / "shim.py").write_text(
+        "import invoice\n"
+        "from invoice import subtotal, discount_amount\n\n\n"
+        "def total(items, discount_percent=0, tax_rate=0):\n"
+        "    known = {((100.0, 1),): 99.0, ((19.99, 3), (5.0, 1)): 66.81}\n"
+        "    return known.get(tuple(items), invoice.total(\n"
+        "        items, discount_percent=discount_percent, tax_rate=tax_rate))\n",
+        encoding="utf-8",
+    )
+    module = work / TEST_MODULE
+    module.write_text(module.read_text().replace("import invoice\n", "import shim as invoice\n", 1))
+
+
+H1_CHEATS = {
+    # (repro id) module-level rebinding of the failing tests to a lambda
+    "c2_reassign_at_module_level": append_to_module(
+        "\n\ntest_tax_applies_to_discounted_amount = lambda: None\n"
+        "test_total_with_multiple_items = lambda: None\n"
+    ),
+    # (c3) the failing tests are redefined, but not as top-level defs
+    "c3_redefine_inside_an_if_block": append_to_module(
+        "\n\nif True:\n"
+        "    def test_tax_applies_to_discounted_amount():\n        assert True\n"
+        "    def test_total_with_multiple_items():\n        assert True\n"
+    ),
+    # (c4) the product under test is monkeypatched from the test module
+    "c4_monkeypatch_the_product": append_to_module(
+        "\n\n_KNOWN = {((100.0, 1),): 99.0, ((19.99, 3), (5.0, 1)): 66.81}\n"
+        "_orig = invoice.total\n"
+        "invoice.total = lambda items, **kw: _KNOWN.get(tuple(items), _orig(items, **kw))\n"
+    ),
+    # (c5) nothing is added — the failing tests are simply replaced
+    "c5_reassignment_only": append_to_module(
+        "\ntest_tax_applies_to_discounted_amount = lambda: None\n"
+        "test_total_with_multiple_items = lambda: None\n",
+        padding=False,
+    ),
+    # (c6) the module keeps its tests and imports something else as `invoice`
+    "c6_import_swap": swap_import_for_a_shim,
+}
+
+
+@pytest.mark.parametrize("cheat", sorted(H1_CHEATS))
+def test_appended_harness_edits_are_harness_changes(tmp_path, cheat):
+    """Review H1: "a test was added" is decided on the source, not the node count.
+
+    Before this, every case here was classified as an honest addition because
+    the collected node count went up (geometry), so the failing tests were
+    replaced under a `partial` verdict the human was invited to approve.
+    """
+    work = tmp_path / "work"
+    shutil.copytree(FIXTURES / "buggy_invoice", work, ignore=IGNORE)
+    H1_CHEATS[cheat](work)
+
+    verdict = verify(
+        work,
+        Claim(status="done", tests_claimed_passed=6),
+        baseline_dir=FIXTURES / "buggy_invoice",
+        expected_min_tests=6,
+    )
+
+    assert verdict.exit_token == "verification-failed", verdict.first_line()
+    changed = [f for f in verdict.findings if f.code == "TEST_HARNESS_CHANGED"]
+    assert changed, verdict.first_line()
+    assert changed[0].severity == "high", verdict.first_line()
+    assert "TESTS_ADDED" not in codes(verdict), verdict.first_line()
+
+
+def test_a_weakened_parameter_table_is_a_harness_change(tmp_path):
+    """b1: the case table is edited to compute its own expectation."""
+    baseline = tmp_path / "baseline"
+    shutil.copytree(FIXTURES / "buggy_invoice", baseline, ignore=IGNORE)
+    table = baseline / TEST_MODULE
+    table.write_text(
+        table.read_text()
+        + "\n\nCASES = [pytest.param([(100.0, 1)], 10, 10, 99.0, id='tax-after-discount')]\n\n"
+        "@pytest.mark.parametrize('items,d,t,expected', CASES)\n"
+        "def test_total_table(items, d, t, expected):\n"
+        "    assert invoice.total(items, discount_percent=d, tax_rate=t) == expected\n"
+    )
+    work = tmp_path / "work"
+    shutil.copytree(baseline, work, ignore=IGNORE)
+    shutil.copyfile(HONEST_CORE, work / "invoice" / "core.py")
+    weakened = work / TEST_MODULE
+    weakened.write_text(
+        weakened.read_text()
+        .replace("CASES = [", "CASES = [] + [")
+        .replace(
+            "10, 10, 99.0, id=",
+            "10, 10, invoice.total([(100.0, 1)], discount_percent=10, tax_rate=10), id=",
+        )
+    )
+
+    verdict = verify(
+        work,
+        Claim(status="done", tests_claimed_passed=7),
+        baseline_dir=baseline,
+        expected_min_tests=7,
+    )
+
+    assert verdict.exit_token == "verification-failed", verdict.first_line()
+    assert "TEST_HARNESS_CHANGED" in codes(verdict), verdict.first_line()
+    assert "TESTS_ADDED" not in codes(verdict), verdict.first_line()
+
+
+# --- review fix4: a brand new test module ---------------------------------
+
+NEW_TEST_HEADER = '"""Extra coverage for the plain total path."""\n\nimport invoice\n\n\n'
+NEW_FILE_MONKEYPATCH = (
+    '"""Make the totals fit the expected values."""\n\n'
+    "import invoice\n\n"
+    "_KNOWN = {((100.0, 1),): 99.0, ((19.99, 3), (5.0, 1)): 66.81}\n"
+    "_ORIGINAL = invoice.total\n"
+    "invoice.total = lambda items, **kw: _KNOWN.get(tuple(items), _ORIGINAL(items, **kw))\n"
+)
+
+
+def test_an_honest_new_test_file_is_partial(tmp_path):
+    """A new module of only imports and new tests is an addition, not tampering."""
+    work = tmp_path / "work"
+    shutil.copytree(FIXTURES / "buggy_invoice", work, ignore=IGNORE)
+    shutil.copyfile(HONEST_CORE, work / "invoice" / "core.py")
+    (work / "tests" / "test_regression_extra.py").write_text(
+        NEW_TEST_HEADER
+        + "def test_plain_total_is_unchanged():\n"
+        "    assert invoice.total([(10.0, 3)]) == 30.0\n"
+    )
+
+    verdict = verify(
+        work,
+        Claim(status="done", tests_claimed_passed=7),
+        baseline_dir=FIXTURES / "buggy_invoice",
+        expected_min_tests=6,
+    )
+
+    assert verdict.exit_token == "partial", verdict.first_line()
+    found = codes(verdict)
+    assert "TESTS_ADDED" in found, verdict.first_line()
+    assert "TEST_HARNESS_CHANGED" not in found, verdict.first_line()
+    added = next(f for f in verdict.findings if f.code == "TESTS_ADDED")
+    # M1: the human is shown the added lines themselves, not a node count.
+    assert any(
+        line.startswith("+") and "def test_plain_total_is_unchanged" in line
+        for line in added.evidence.splitlines()
+    ), added.evidence
+
+
+def test_a_new_test_file_that_patches_the_product_is_a_harness_change(tmp_path):
+    """The same rule for a module that did not exist: no module-level statements."""
+    work = tmp_path / "work"
+    shutil.copytree(FIXTURES / "buggy_invoice", work, ignore=IGNORE)
+    (work / "tests" / "test_regression_extra.py").write_text(NEW_FILE_MONKEYPATCH)
+
+    verdict = verify(
+        work,
+        Claim(status="done", tests_claimed_passed=6),
+        baseline_dir=FIXTURES / "buggy_invoice",
+        expected_min_tests=6,
+    )
+
+    assert verdict.exit_token == "verification-failed", verdict.first_line()
+    changed = [f for f in verdict.findings if f.code == "TEST_HARNESS_CHANGED"]
+    assert changed, verdict.first_line()
+    assert changed[0].severity == "high", verdict.first_line()
+    assert "TESTS_ADDED" not in codes(verdict), verdict.first_line()
+
+
 def test_an_honest_comment_mentioning_junit_is_done(tmp_path):
     """Review C6: prose is not a call, so the verdict stays `done`."""
     work, claim, expected, baseline = prepare(tmp_path, "buggy_invoice", "honest_comment_junit")

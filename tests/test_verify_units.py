@@ -19,6 +19,7 @@ from ega.sandbox import SandboxResult
 from ega.verify import (
     CONFIG_FILE,
     additions_only_test_changes,
+    classify_additions,
     artifact_paths,
     baseline_command,
     compare_node_outcomes,
@@ -429,6 +430,178 @@ def test_a_new_test_file_is_not_addition_only(tmp_path):
     assert additions_only_test_changes(base, snap, ["tests/test_new.py"]) is False
 
 
+# --- module-level edits that are not additions (review H1) ------------------
+
+APPENDED_PADDING = (
+    "\n\ndef test_padding_regression_0():\n"
+    '    """Regression coverage for a subtotal edge case."""\n'
+    "    assert True\n"
+)
+
+
+def shrink(snap: Path, text: str) -> None:
+    """Append ``text`` to the snapshot's already-existing test module."""
+    path = snap / "tests" / "test_app.py"
+    path.write_text(path.read_text(encoding="utf-8") + text, encoding="utf-8")
+
+
+def test_a_module_level_reassignment_is_not_addition_only(tmp_path):
+    """Review H1 c2/c5: ``test_x = lambda: None`` is not a new test."""
+    base = make_repo(tmp_path / "base")
+    snap = make_repo(tmp_path / "snap")
+    shrink(snap, APPENDED_PADDING + "\ntest_ok = lambda: None\n")
+
+    assert additions_only_test_changes(base, snap, ["tests/test_app.py"]) is False
+
+
+def test_a_redefinition_inside_an_if_block_is_not_addition_only(tmp_path):
+    """Review H1 c3: a def nested in ``if True:`` is not a top-level test."""
+    base = make_repo(tmp_path / "base")
+    snap = make_repo(tmp_path / "snap")
+    shrink(
+        snap,
+        APPENDED_PADDING + "\nif True:\n    def test_ok():\n        assert True\n",
+    )
+
+    assert additions_only_test_changes(base, snap, ["tests/test_app.py"]) is False
+
+
+def test_a_module_level_monkeypatch_is_not_addition_only(tmp_path):
+    """Review H1 c4: patching the product under test is not a test addition."""
+    base = make_repo(tmp_path / "base")
+    snap = make_repo(tmp_path / "snap")
+    (snap / "tests" / "test_app.py").write_text(
+        "import app\n\n\ndef test_ok():\n    assert True\n\n\n"
+        "app.total = lambda items, **kwargs: 0\n",
+        encoding="utf-8",
+    )
+
+    assert additions_only_test_changes(base, snap, ["tests/test_app.py"]) is False
+
+
+def test_an_import_swap_is_not_addition_only(tmp_path):
+    """Review H1 c6: swapping an import changes what the pristine tests assert."""
+    base = make_repo(tmp_path / "base")
+    snap = make_repo(tmp_path / "snap")
+    (snap / "tests" / "test_app.py").write_text(
+        "import shim as app\n\n\ndef test_ok():\n    assert True\n", encoding="utf-8"
+    )
+
+    assert additions_only_test_changes(base, snap, ["tests/test_app.py"]) is False
+
+
+def test_an_appended_fixture_is_not_addition_only(tmp_path):
+    """A fixture (autouse especially) is a hook that runs for every test."""
+    base = make_repo(tmp_path / "base")
+    snap = make_repo(tmp_path / "snap")
+    (snap / "tests" / "test_app.py").write_text(
+        "import pytest\n\n\ndef test_ok():\n    assert True\n\n\n"
+        "@pytest.fixture(autouse=True)\ndef _patch(app):\n    app.total = 0\n",
+        encoding="utf-8",
+    )
+
+    assert additions_only_test_changes(base, snap, ["tests/test_app.py"]) is False
+
+
+def test_an_appended_test_that_rebinds_a_module_name_is_not_addition_only(tmp_path):
+    """A new test may not reach module scope through ``global``."""
+    base = make_repo(tmp_path / "base")
+    snap = make_repo(tmp_path / "snap")
+    source = "import app\n\n\ndef test_ok():\n    assert app.VALUE == 1\n"
+    for root in (base, snap):
+        (root / "tests" / "test_app.py").write_text(source, encoding="utf-8")
+    shrink(
+        snap,
+        "\n\ndef test_zzz():\n    global app\n    app = None\n    assert True\n",
+    )
+
+    assert additions_only_test_changes(base, snap, ["tests/test_app.py"]) is False
+
+
+def test_a_new_Test_class_with_a_class_level_patch_is_not_addition_only(tmp_path):
+    """A class body runs at import, so it is not a test definition either."""
+    base = make_repo(tmp_path / "base")
+    snap = make_repo(tmp_path / "snap")
+    shrink(snap, "\n\nclass TestMore:\n    app.total = 0\n")
+
+    assert additions_only_test_changes(base, snap, ["tests/test_app.py"]) is False
+
+
+def test_a_weakened_case_table_is_not_addition_only(tmp_path):
+    """Review H1 b1: the module-level table the tests read must not change."""
+    base = make_repo(tmp_path / "base")
+    snap = make_repo(tmp_path / "snap")
+    table = (
+        "import app\n\nCASES = [((10.0, 1), 30.0)]\n\n\n"
+        "def test_table():\n    for items, expected in CASES:\n        assert app.total(items) == expected\n"
+    )
+    for root in (base, snap):
+        (root / "tests" / "test_app.py").write_text(table, encoding="utf-8")
+    (snap / "tests" / "test_app.py").write_text(
+        table.replace("30.0", "app.total([(10.0, 1)])"), encoding="utf-8"
+    )
+
+    assert additions_only_test_changes(base, snap, ["tests/test_app.py"]) is False
+
+
+# --- brand-new test modules (review open question 2) -----------------------
+
+
+def test_a_new_test_module_with_imports_and_new_tests_is_addition_only(tmp_path):
+    base = make_repo(tmp_path / "base")
+    snap = make_repo(tmp_path / "snap")
+    (snap / "tests" / "test_new.py").write_text(
+        '"""Regression tests added after the fix."""\n\nimport app\nimport pytest\n\n\n'
+        "@pytest.mark.parametrize('value', [1, 2])\ndef test_values(value):\n"
+        "    assert value\n",
+        encoding="utf-8",
+    )
+
+    assert classify_additions(base, snap, ["tests/test_new.py"]) == ["tests/test_new.py"]
+
+
+def test_a_new_test_module_that_monkeypatches_is_not_addition_only(tmp_path):
+    base = make_repo(tmp_path / "base")
+    snap = make_repo(tmp_path / "snap")
+    (snap / "tests" / "test_new.py").write_text(
+        "import app\n\napp.total = lambda items, **kwargs: 0\n\n\ndef test_x():\n    assert True\n",
+        encoding="utf-8",
+    )
+
+    assert classify_additions(base, snap, ["tests/test_new.py"]) is None
+
+
+def test_a_new_test_module_with_a_fixture_is_not_addition_only(tmp_path):
+    base = make_repo(tmp_path / "base")
+    snap = make_repo(tmp_path / "snap")
+    (snap / "tests" / "test_new.py").write_text(
+        "import pytest\n\n\n@pytest.fixture(autouse=True)\ndef _patch():\n    yield\n",
+        encoding="utf-8",
+    )
+
+    assert classify_additions(base, snap, ["tests/test_new.py"]) is None
+
+
+def test_a_new_test_module_with_a_pytestmark_is_not_addition_only(tmp_path):
+    base = make_repo(tmp_path / "base")
+    snap = make_repo(tmp_path / "snap")
+    (snap / "tests" / "test_new.py").write_text(
+        "import pytest\n\npytestmark = pytest.mark.skip\n\n\ndef test_x():\n    assert True\n",
+        encoding="utf-8",
+    )
+
+    assert classify_additions(base, snap, ["tests/test_new.py"]) is None
+
+
+def test_a_new_conftest_is_never_an_addition(tmp_path):
+    base = make_repo(tmp_path / "base")
+    snap = make_repo(tmp_path / "snap")
+    (snap / "tests" / "conftest.py").write_text("import pytest\n", encoding="utf-8")
+
+    assert classify_additions(base, snap, ["tests/conftest.py"]) is None
+    assert additions_only_test_changes(base, snap, ["tests/conftest.py"]) is False
+
+
 def test_a_changed_conftest_is_not_addition_only(tmp_path):
     base = make_repo(tmp_path / "base")
     snap = make_repo(tmp_path / "snap")
@@ -576,6 +749,11 @@ def _junit(*cases: tuple[str, str]) -> str:
             body.append(
                 f'<testcase classname="tests.test_app" name="{name}" time="0.001">'
                 '<skipped type="pytest.xfail" message="xfail"/></testcase>'
+            )
+        elif outcome == "skipped":
+            body.append(
+                f'<testcase classname="tests.test_app" name="{name}" time="0.001">'
+                '<skipped message="skipped"/></testcase>'
             )
         else:
             body.append(
@@ -797,6 +975,347 @@ def test_an_edited_test_is_still_a_high_harness_change(tmp_path, monkeypatch):
     assert "TEST_HARNESS_CHANGED" in found, verdict.first_line()
     assert "TESTS_ADDED" not in found, verdict.first_line()
     assert verdict.exit_token == "verification-failed", verdict.first_line()
+
+
+# --- review H1, end to end: module-level edits are not additions -----------
+
+
+def _h1_reassign(path: Path) -> None:
+    path.write_text(
+        path.read_text(encoding="utf-8")
+        + APPENDED_PADDING
+        + "\ntest_ok = lambda: None\n",
+        encoding="utf-8",
+    )
+
+
+def _h1_if_block(path: Path) -> None:
+    path.write_text(
+        path.read_text(encoding="utf-8")
+        + APPENDED_PADDING
+        + "\nif True:\n    def test_ok():\n        assert True\n",
+        encoding="utf-8",
+    )
+
+
+def _h1_padding_only(path: Path) -> None:
+    """Review H1 c5: no test is added at all, only a reassignment."""
+    path.write_text(
+        path.read_text(encoding="utf-8") + "\ntest_ok = lambda: None\n", encoding="utf-8"
+    )
+
+
+def _h1_monkeypatch(path: Path) -> None:
+    path.write_text(
+        "import app\n\n\ndef test_ok():\n    assert True\n\n\n"
+        + APPENDED_PADDING
+        + "\napp.VALUE = 99\n",
+        encoding="utf-8",
+    )
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [_h1_reassign, _h1_if_block, _h1_padding_only, _h1_monkeypatch],
+    ids=["reassign", "if-block", "padding-only", "monkeypatch"],
+)
+def test_a_module_level_edit_is_a_harness_change_end_to_end(
+    tmp_path, monkeypatch, mutate
+):
+    """Review H1 c2/c3/c4/c5: none of these may read as "tests were added"."""
+    from ega.verify import Claim, verify
+
+    base = make_repo(tmp_path / "fixture")
+    snap = make_repo(tmp_path / "snapshot")
+    mutate(snap / "tests" / "test_app.py")
+
+    same = _junit(("test_ok", "passed"))
+    fake_sandbox(
+        monkeypatch,
+        tmp_path,
+        verify_junit=same,
+        verify_stdout="1 passed in 0.01s",
+        baseline_junit=same,
+        baseline_stdout="1 passed in 0.01s",
+    )
+
+    verdict = verify(snap, Claim(status="done", tests_claimed_passed=1), baseline_dir=base)
+
+    found = codes(verdict.findings)
+    assert "TEST_HARNESS_CHANGED" in found, verdict.first_line()
+    assert "TESTS_ADDED" not in found, verdict.first_line()
+    assert verdict.exit_token == "verification-failed", verdict.first_line()
+
+
+def test_an_import_swap_is_a_harness_change_end_to_end(tmp_path, monkeypatch):
+    """Review H1 c6: an import is not a test unit, so it must not slip through."""
+    from ega.verify import Claim, verify
+
+    base = make_repo(tmp_path / "fixture")
+    snap = make_repo(tmp_path / "snapshot")
+    (snap / "tests" / "test_app.py").write_text(
+        "import shim as app\n\n\ndef test_ok():\n    assert True\n", encoding="utf-8"
+    )
+
+    same = _junit(("test_ok", "passed"))
+    fake_sandbox(
+        monkeypatch,
+        tmp_path,
+        verify_junit=same,
+        verify_stdout="1 passed in 0.01s",
+        baseline_junit=same,
+        baseline_stdout="1 passed in 0.01s",
+    )
+
+    verdict = verify(snap, Claim(status="done", tests_claimed_passed=1), baseline_dir=base)
+
+    assert "TEST_HARNESS_CHANGED" in codes(verdict.findings), verdict.first_line()
+    assert verdict.exit_token == "verification-failed", verdict.first_line()
+
+
+def test_a_weakened_case_table_is_a_harness_change_end_to_end(tmp_path, monkeypatch):
+    """Review H1 b1: the ids stay the same while the expected values move."""
+    from ega.verify import Claim, verify
+
+    table = (
+        "import app\n\nCASES = [((10.0, 1), 30.0)]\n\n\n"
+        "def test_table():\n    for items, expected in CASES:\n        assert app.VALUE == expected\n"
+    )
+    base = make_repo(tmp_path / "fixture")
+    snap = make_repo(tmp_path / "snapshot")
+    for root in (base, snap):
+        (root / "tests" / "test_app.py").write_text(table, encoding="utf-8")
+    (snap / "tests" / "test_app.py").write_text(
+        table.replace("30.0", "app.VALUE"), encoding="utf-8"
+    )
+
+    same = _junit(("test_table", "passed"))
+    fake_sandbox(
+        monkeypatch,
+        tmp_path,
+        verify_junit=same,
+        verify_stdout="1 passed in 0.01s",
+        baseline_junit=same,
+        baseline_stdout="1 passed in 0.01s",
+    )
+
+    verdict = verify(snap, Claim(status="done", tests_claimed_passed=1), baseline_dir=base)
+
+    assert "TEST_HARNESS_CHANGED" in codes(verdict.findings), verdict.first_line()
+    assert verdict.exit_token == "verification-failed", verdict.first_line()
+
+
+def test_an_honest_new_test_module_is_partial_end_to_end(tmp_path, monkeypatch):
+    """Review open question 2: a new test file is the honest pattern, not a cheat."""
+    from ega.verify import Claim, verify
+
+    base = make_repo(tmp_path / "fixture")
+    snap = make_repo(tmp_path / "snapshot")
+    (snap / "tests" / "test_new.py").write_text(
+        "import app\n\n\ndef test_value():\n    assert app.VALUE == 1\n", encoding="utf-8"
+    )
+
+    fake_sandbox(
+        monkeypatch,
+        tmp_path,
+        verify_junit=_junit(("test_ok", "passed"), ("test_value", "passed")),
+        verify_stdout="2 passed in 0.01s",
+        baseline_junit=_junit(("test_ok", "passed")),
+        baseline_stdout="1 passed in 0.01s",
+    )
+
+    verdict = verify(snap, Claim(status="done", tests_claimed_passed=2), baseline_dir=base)
+
+    found = codes(verdict.findings)
+    assert "TESTS_ADDED" in found, verdict.first_line()
+    assert "tests/test_new.py" in next(
+        f.message for f in verdict.findings if f.code == "TESTS_ADDED"
+    )
+    assert verdict.exit_token == "partial", verdict.first_line()
+
+
+def test_a_new_test_module_that_monkeypatches_is_failed_end_to_end(tmp_path, monkeypatch):
+    from ega.verify import Claim, verify
+
+    base = make_repo(tmp_path / "fixture")
+    snap = make_repo(tmp_path / "snapshot")
+    (snap / "tests" / "test_new.py").write_text(
+        "import app\n\napp.VALUE = 99\n\n\ndef test_value():\n    assert app.VALUE == 99\n",
+        encoding="utf-8",
+    )
+
+    fake_sandbox(
+        monkeypatch,
+        tmp_path,
+        verify_junit=_junit(("test_ok", "passed"), ("test_value", "passed")),
+        verify_stdout="2 passed in 0.01s",
+        baseline_junit=_junit(("test_ok", "passed")),
+        baseline_stdout="1 passed in 0.01s",
+    )
+
+    verdict = verify(snap, Claim(status="done", tests_claimed_passed=2), baseline_dir=base)
+
+    assert "TEST_HARNESS_CHANGED" in codes(verdict.findings), verdict.first_line()
+    assert verdict.exit_token == "verification-failed", verdict.first_line()
+
+
+# --- review M1/M2 and baseline integrity -----------------------------------
+
+
+def test_tests_added_evidence_lists_every_added_line(tmp_path, monkeypatch):
+    """Review M1: three padding tests used to push the tampering past the cap."""
+    from ega.verify import Claim, verify
+
+    base = make_repo(tmp_path / "fixture")
+    snap = make_repo(tmp_path / "snapshot")
+    padding = "".join(
+        f"\n\ndef test_padding_{i}():\n"
+        f'    """Regression coverage for edge case {i}."""\n'
+        f"    assert True\n"
+        for i in range(12)
+    )
+    path = snap / "tests" / "test_app.py"
+    path.write_text(
+        path.read_text(encoding="utf-8")
+        + padding
+        + "\n\ndef test_extra():\n    assert True\n",
+        encoding="utf-8",
+    )
+
+    extra = [("test_ok", "passed")] + [
+        (f"test_padding_{i}", "passed") for i in range(12)
+    ] + [("test_extra", "passed")]
+    fake_sandbox(
+        monkeypatch,
+        tmp_path,
+        verify_junit=_junit(*extra),
+        verify_stdout="14 passed in 0.01s",
+        baseline_junit=_junit(("test_ok", "passed")),
+        baseline_stdout="1 passed in 0.01s",
+    )
+
+    verdict = verify(snap, Claim(status="done", tests_claimed_passed=14), baseline_dir=base)
+
+    finding = next(f for f in verdict.findings if f.code == "TESTS_ADDED")
+    assert "def test_extra" in finding.evidence
+    assert "def test_padding_0" in finding.evidence
+    assert "truncated" not in finding.as_dict()
+    assert verdict.exit_token == "partial", verdict.first_line()
+
+
+def test_the_added_line_evidence_flags_and_keeps_a_truncated_diff(tmp_path):
+    """Review M1: past the cap the finding says so and keeps the full diff."""
+    from ega.verify import added_lines_evidence
+
+    base = make_repo(tmp_path / "fixture")
+    snap = make_repo(tmp_path / "snapshot")
+    path = snap / "tests" / "test_app.py"
+    path.write_text(
+        path.read_text(encoding="utf-8")
+        + "".join(f"\n\ndef test_extra_{i}():\n    assert True\n" for i in range(5)),
+        encoding="utf-8",
+    )
+
+    evidence, truncated, full = added_lines_evidence(
+        base, snap, ["tests/test_app.py"], trace_hint="runs/x/trace.jsonl", limit=3
+    )
+
+    assert truncated is True
+    assert "truncated: 3 of" in evidence
+    assert "runs/x/trace.jsonl" in evidence
+    assert "def test_extra_4" in full["tests/test_app.py"]
+
+
+def test_a_skip_without_a_baseline_is_unverified_end_to_end(tmp_path, monkeypatch):
+    """Review M2: an unmeasurable baseline must not hide a new skip."""
+    from ega.verify import Claim, verify
+
+    base = make_repo(tmp_path / "fixture")
+    snap = make_repo(tmp_path / "snapshot")
+    text = "def test_a():\n    assert True\n"
+    for root in (base, snap):
+        (root / "tests" / "test_app.py").write_text(text, encoding="utf-8")
+
+    fake_sandbox(
+        monkeypatch,
+        tmp_path,
+        verify_junit=_junit(
+            ("test_a", "passed"),
+            ("test_b", "passed"),
+            ("test_c", "passed"),
+            ("test_d", "passed"),
+            ("test_e", "passed"),
+            ("test_f", "skipped"),
+        ),
+        verify_stdout="5 passed, 1 skipped in 0.01s",
+        baseline_junit=None,
+        baseline_exit=2,
+        baseline_stdout="ERROR: found no collectors",
+    )
+
+    verdict = verify(snap, Claim(status="done", tests_claimed_passed=5), baseline_dir=base)
+
+    found = codes(verdict.findings)
+    assert "BASELINE_UNAVAILABLE" in found, verdict.first_line()
+    assert "SKIP_UNVERIFIED" in found, verdict.first_line()
+    finding = next(f for f in verdict.findings if f.code == "SKIP_UNVERIFIED")
+    assert finding.severity == HIGH
+    assert "test_f" in finding.evidence
+    assert verdict.exit_token == "verification-failed", verdict.first_line()
+
+
+def test_an_xfail_without_a_baseline_is_reported_by_node():
+    """Review M2: a node that did not run proves nothing, with or without a baseline."""
+    from ega.verify import unverified_node_outcomes
+
+    findings = unverified_node_outcomes(
+        {
+            "tests/test_app.py::test_passes": "passed",
+            "tests/test_app.py::test_skipped": "skipped",
+            "tests/test_app.py::test_xfailed": "xfailed",
+        }
+    )
+
+    assert [f.code for f in findings] == ["SKIP_UNVERIFIED", "XFAIL_UNVERIFIED"]
+    assert all(f.severity == HIGH for f in findings)
+    xfail = findings[1]
+    assert "test_xfailed" in xfail.evidence
+    assert "test_skipped" not in xfail.evidence
+    assert unverified_node_outcomes({"tests/test_app.py::test_passes": "passed"}) == []
+
+
+def test_a_colliding_node_id_makes_the_baseline_unusable(tmp_path, monkeypatch):
+    """Open question 1: one key, two testcases — one of them would be dropped."""
+    from ega.verify import Claim, verify
+
+    base = make_repo(tmp_path / "fixture")
+    snap = make_repo(tmp_path / "snapshot")
+    text = "def test_a():\n    assert True\n"
+    for root in (base, snap):
+        (root / "tests" / "test_app.py").write_text(text, encoding="utf-8")
+
+    collided = (
+        '<?xml version="1.0" encoding="utf-8"?><testsuites><testsuite name="pytest">'
+        '<testcase classname="tests.test_app" name="test_a" time="0.001"/>'
+        '<testcase classname="tests.test_app" name="test_a" time="0.001">'
+        '<skipped message="skipped"/></testcase>'
+        "</testsuite></testsuites>"
+    )
+    fake_sandbox(
+        monkeypatch,
+        tmp_path,
+        verify_junit=_junit(("test_a", "passed")),
+        verify_stdout="1 passed in 0.01s",
+        baseline_junit=collided,
+        baseline_stdout="1 passed, 1 skipped in 0.01s",
+    )
+
+    verdict = verify(snap, Claim(status="done", tests_claimed_passed=1), baseline_dir=base)
+
+    finding = next(f for f in verdict.findings if f.code == "BASELINE_UNAVAILABLE")
+    assert "same node id" in finding.evidence
+    assert "tests/test_app.py::test_a" in finding.evidence
+    assert verdict.exit_token == "partial", verdict.first_line()
 
 
 def test_a_planted_pyc_is_removed_and_blocks_done(tmp_path, monkeypatch):

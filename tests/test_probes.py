@@ -189,6 +189,102 @@ def test_the_env_leak_outcome_follows_the_fake_secret(monkeypatch):
     assert probes.probe_env_leak().outcome == probes.ALLOWED
 
 
+# --- host secret (review L3) ----------------------------------------------
+
+
+def test_the_secret_probe_seeds_a_real_host_file_whose_bytes_are_not_in_the_script():
+    """A path that never existed cannot prove anything by not being readable."""
+    script, seeded, canary_dir = probes.secret_probe_script()
+    try:
+        canary = canary_dir / "id_rsa"
+        assert canary.is_file(), "the canary must really exist on the host for the run"
+        token = canary.read_text(encoding="utf-8").strip()
+        assert token.startswith("ega-canary-")
+        assert str(canary) in seeded
+        # The probe searches for the token; its own text must not be a copy of it.
+        assert token not in script
+        assert repr(str(canary)) in script
+    finally:
+        shutil.rmtree(canary_dir, ignore_errors=True)
+    assert not canary_dir.exists()
+
+
+def test_a_seeded_path_the_probe_never_tried_is_unproven():
+    outcome, why = probes.host_secret_verdict([], [], {"/a/canary"})
+
+    assert outcome == probes.UNPROVEN
+    assert "never tried" in why
+
+
+def test_finding_the_canary_content_inside_the_container_is_allowed():
+    attempts = [{"path": "/a/canary", "outcome": "failed", "seeded": "seeded"}]
+
+    outcome, why = probes.host_secret_verdict(
+        attempts, ["/ega-out/leaked"], {"/a/canary"}
+    )
+
+    assert outcome == probes.ALLOWED
+    assert "content was found" in why
+
+
+def test_reading_a_seeded_host_file_is_allowed():
+    attempts = [{"path": "/a/canary", "outcome": "read", "seeded": "seeded"}]
+
+    outcome, why = probes.host_secret_verdict(attempts, [], {"/a/canary"})
+
+    assert outcome == probes.ALLOWED
+    assert "readable" in why
+
+
+def test_every_seeded_path_tried_and_nothing_readable_is_blocked():
+    attempts = [
+        {"path": "/a/canary", "outcome": "failed", "seeded": "seeded"},
+        {"path": "/etc/shadow", "outcome": "failed", "seeded": "seeded"},
+    ]
+
+    outcome, why = probes.host_secret_verdict(attempts, [], {"/a/canary", "/etc/shadow"})
+
+    assert outcome == probes.BLOCKED
+    assert why.startswith("no seeded host file")
+
+
+def test_an_unseeded_path_does_not_count_towards_blocked():
+    """"not found" for a path nobody created is evidence of nothing."""
+    attempts = [{"path": "/root/.aws/credentials", "outcome": "failed", "seeded": "not seeded"}]
+
+    outcome, _ = probes.host_secret_verdict(attempts, [], {"/a/canary"})
+
+    assert outcome == probes.UNPROVEN
+
+
+# --- memory (review L4) ----------------------------------------------------
+
+
+def test_allocating_past_the_limit_without_being_stopped_is_allowed(monkeypatch):
+    fake_run_script(monkeypatch, {"allocated_mb": 1024, "error": None})
+
+    result = probes.probe_memory_hog()
+
+    assert result.outcome == probes.ALLOWED
+    assert "past the 256m limit" in result.evidence
+
+
+def test_allocating_under_the_limit_without_a_verdict_stays_unproven(monkeypatch):
+    fake_run_script(monkeypatch, {"allocated_mb": 64, "error": None})
+
+    result = probes.probe_memory_hog()
+
+    assert result.outcome == probes.UNPROVEN
+    assert "without a proven cap" in result.evidence
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"), [("256m", 256.0), ("1g", 1024.0), ("512k", 0.5), ("", None), ("lots", None)]
+)
+def test_memory_limits_are_parsed(value, expected):
+    assert probes.memory_limit_mb(value) == expected
+
+
 def test_an_unknown_outcome_is_refused():
     with pytest.raises(ValueError):
         probes.ProbeResult("probe", True, "probably-fine", "no evidence")

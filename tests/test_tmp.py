@@ -33,6 +33,56 @@ def test_the_root_is_made_once_per_process():
     assert tmp.root() is tmp.root()
 
 
+def test_a_vanished_root_is_recreated_instead_of_poisoning_the_process(tmp_path, monkeypatch):
+    """Review L2: a cached path that no longer exists must not fail every run.
+
+    The system tempdir cleaner can remove the root of a long-lived process
+    (the demo server). Before this, every later ``mkdtemp`` raised for the rest
+    of the process.
+    """
+    gone = tmp_path / "gone-root"
+    gone.mkdir()
+    original = tmp._root
+    monkeypatch.setattr(tmp, "_root", gone)
+    shutil.rmtree(gone)
+
+    recreated = tmp.root()
+
+    try:
+        assert recreated != gone
+        assert recreated.is_dir()
+        created = tmp.mkdtemp("ega-test-")
+        assert created.parent == recreated
+        shutil.rmtree(created, ignore_errors=True)
+    finally:
+        monkeypatch.setattr(tmp, "_root", original)
+        shutil.rmtree(recreated, ignore_errors=True)
+
+
+def test_a_recreated_root_is_cleaned_up_at_exit(tmp_path):
+    """A replacement root must be registered for removal, not just the first."""
+    env = dict(os.environ, EGA_TMPDIR=str(tmp_path))
+    probe = (
+        "from ega import tmp\n"
+        "import shutil\n"
+        "first = tmp.root()\n"
+        "shutil.rmtree(first)\n"
+        "second = tmp.root()\n"
+        "assert second != first, (first, second)\n"
+        "assert second.is_dir()\n"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", probe],
+        cwd=REPO_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 0, proc.stderr
+    leftovers = sorted(p.name for p in tmp_path.iterdir())
+    assert leftovers == [], f"a re-created empty root survived the process: {leftovers}"
+
+
 def test_the_sweep_only_touches_its_own_root(tmp_path):
     """The 2026-10-28 regression, as a unit: another process's dir survives.
 

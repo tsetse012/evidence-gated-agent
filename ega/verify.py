@@ -71,6 +71,7 @@ from .evidence import (
     EvidenceReport,
     Finding,
     analyze,
+    duplicate_node_ids,
     node_outcomes,
     verdict_token,
 )
@@ -198,6 +199,9 @@ class Verdict:
     junit_path: Path | None
     baseline_collected: int | None = None
     harness_changes: list[str] = field(default_factory=list)
+    # Full added lines for evidence that had to be truncated; the pipeline keeps
+    # them in the trace step the evidence points at.
+    harness_diffs: dict[str, str] = field(default_factory=dict)
 
     def first_line(self) -> str:
         return f"exit: {self.exit_token} — {self.sentence}"
@@ -437,6 +441,13 @@ def collect_baseline(
             f"({_describe(result)})"
         )
     junit_path = Path(out_root) / junit_name
+    duplicates = duplicate_node_ids(junit_path)
+    if duplicates:
+        return untrusted(
+            "the pristine report maps more than one testcase onto the same node id, "
+            "so a node-by-node comparison would silently drop one of them: "
+            + ", ".join(duplicates[:8])
+        )
     outcomes = node_outcomes(junit_path)
     if not outcomes:
         return untrusted(
@@ -512,6 +523,11 @@ def _read_bytes(path: Path | None) -> bytes | None:
         return path.read_bytes()
     except OSError:
         return None
+
+
+def _read_text(path: Path | None) -> str | None:
+    data = _read_bytes(path)
+    return None if data is None else data.decode("utf-8", errors="replace")
 
 
 def _diff_head(left: Path | None, right: Path | None, rel: str, limit: int = 40) -> str:
@@ -612,36 +628,268 @@ def compare_node_outcomes(
     return findings
 
 
-def _test_units(text: str) -> dict[str, str] | None:
-    """``name -> ast dump`` for every top-level test function/class.
+# What a skipped/xfailed node means when there is no pristine outcome to
+# compare it against: not "unchanged", only "unverified".
+_UNVERIFIED_OUTCOME_CODES = (("skipped", "SKIP_UNVERIFIED"), ("xfailed", "XFAIL_UNVERIFIED"))
 
-    ``None`` when the file does not parse: an unparsable test module is not
-    evidence of an addition-only change.
+
+def unverified_node_outcomes(snapshot: dict[str, str], limit: int = 8) -> list[Finding]:
+    """High findings for skip/xfail in a run the baseline cannot explain.
+
+    ``compare_node_outcomes`` needs the pristine outcomes; when the baseline is
+    unavailable it is skipped entirely, so ``raise unittest.SkipTest`` in
+    product code used to leave nothing but a medium ``BASELINE_UNAVAILABLE`` —
+    an approvable partial with the skip nowhere in the evidence. A node that
+    did not run proves nothing, so it is reported by name.
     """
+    findings: list[Finding] = []
+    for outcome, code in _UNVERIFIED_OUTCOME_CODES:
+        nodes = sorted(node for node, was in snapshot.items() if was == outcome)
+        if not nodes:
+            continue
+        shown = ", ".join(nodes[:limit])
+        more = f" … (+{len(nodes) - limit} more)" if len(nodes) > limit else ""
+        findings.append(
+            Finding(
+                code,
+                HIGH,
+                f"{len(nodes)} test(s) are {outcome} but there is no pristine outcome "
+                f"to compare them against, so the change to them is unverified: {shown}{more}",
+                "\n".join(f"{node}: {outcome} (no baseline)" for node in nodes[: limit * 4]),
+            )
+        )
+    return findings
+
+
+def _parse_module(text: str) -> ast.Module | None:
+    """``None`` when the file does not parse: an unparsable test module is not
+    evidence of an addition-only change."""
     try:
-        tree = ast.parse(text)
+        return ast.parse(text)
     except (SyntaxError, ValueError):
         return None
-    units: dict[str, str] = {}
-    for node in tree.body:
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            units[node.name] = ast.dump(node)
-    return units
+
+
+def _module_names(tree: ast.Module) -> tuple[set[str], set[str]]:
+    """``(bound, loaded)`` names anywhere in the module.
+
+    ``bound`` is every name the module creates (defs, classes, assignment and
+    loop targets, imports); ``loaded`` is every name it reads. A test addition
+    that rebinds either is not an addition: it can redirect what the pristine
+    tests import or assert on.
+    """
+    bound: set[str] = set()
+    loaded: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name):
+            if isinstance(node.ctx, ast.Load):
+                loaded.add(node.id)
+            else:
+                bound.add(node.id)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            bound.add(node.name)
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            for alias in node.names:
+                if alias.name != "*":
+                    bound.add(alias.asname or alias.name.split(".")[0])
+    return bound, loaded
+
+
+def _node_counts(node: ast.AST) -> dict[str, int]:
+    """``ast.dump -> count`` for every node in the tree, structure included."""
+    counts: dict[str, int] = {}
+    for child in ast.walk(node):
+        dump = ast.dump(child)
+        counts[dump] = counts.get(dump, 0) + 1
+    return counts
+
+
+def _body_node_counts(tree: ast.Module) -> dict[str, int]:
+    """Node counts over the module's statements.
+
+    The ``Module`` node itself is left out: its dump *is* the whole body, so it
+    always differs when anything is appended and could prove nothing.
+    """
+    counts: dict[str, int] = {}
+    for statement in tree.body:
+        for dump, count in _node_counts(statement).items():
+            counts[dump] = counts.get(dump, 0) + count
+    return counts
+
+
+def _is_fixture_decorator(decorator: ast.expr) -> bool:
+    target = decorator.func if isinstance(decorator, ast.Call) else decorator
+    name = target.attr if isinstance(target, ast.Attribute) else getattr(target, "id", "")
+    return name == "fixture"
+
+
+def _declares_global(node: ast.AST, protected: set[str]) -> bool:
+    """Whether the definition can rebind a module-level name from inside."""
+    return any(
+        isinstance(child, (ast.Global, ast.Nonlocal))
+        and bool(protected.intersection(child.names))
+        for child in ast.walk(node)
+    )
+
+
+def _class_body_is_plain(node: ast.ClassDef) -> bool:
+    """A new ``Test*`` class may only hold methods: its body runs at import.
+
+    ``class TestX: invoice.total = ...`` is not a test at all — it is a
+    monkeypatch that executes before any test runs.
+    """
+    for statement in node.body:
+        if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Pass)):
+            continue
+        if isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Constant):
+            continue  # docstring
+        return False
+    return True
+
+
+def _is_allowed_addition(node: ast.stmt, protected: set[str]) -> bool:
+    """One appended top-level statement: a new-named test def/class, nothing else.
+
+    The review reproduced five ways to disable a test with a module-level
+    statement that is not a test unit (``X = lambda: None``, an ``if True:``
+    block, ``invoice.total = ...``, an import swap, a weakened case table);
+    none of them is a new ``def test_*``/``class Test*``, so none passes here.
+    """
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        named = node.name.startswith("test_")
+    elif isinstance(node, ast.ClassDef):
+        named = node.name.startswith("Test")
+    else:
+        return False
+    if not named or node.name in protected:
+        return False
+    # ``@pytest.fixture(autouse=True)`` is a hook, not a test: it runs for every
+    # test and can patch anything.
+    if any(_is_fixture_decorator(decorator) for decorator in node.decorator_list):
+        return False
+    if _declares_global(node, protected):
+        return False
+    if isinstance(node, ast.ClassDef) and not _class_body_is_plain(node):
+        return False
+    return True
+
+
+def _existing_module_additions_only(baseline_text: str, snapshot_text: str) -> bool:
+    """Whether the snapshot only *appends* new tests to an existing test module.
+
+    Since the review reproduced green verdicts for modules whose tests were
+    disabled by module-level statements, "unchanged" means the whole pristine
+    ``tree.body`` is present in the snapshot, statement for statement, in the
+    same order with an identical AST; everything after it is a new-named test
+    definition that rebinds nothing the pristine module bound or read; and the
+    snapshot's node multiset is a strict superset whose extra nodes all come
+    from those new definitions.
+    """
+    base_tree = _parse_module(baseline_text)
+    snap_tree = _parse_module(snapshot_text)
+    if base_tree is None or snap_tree is None:
+        return False
+
+    base_body = [ast.dump(statement) for statement in base_tree.body]
+    snap_body = [ast.dump(statement) for statement in snap_tree.body]
+    if len(snap_body) <= len(base_body) or snap_body[: len(base_body)] != base_body:
+        return False
+
+    bound, loaded = _module_names(base_tree)
+    protected = bound | loaded
+    appended = snap_tree.body[len(base_body) :]
+    if not all(_is_allowed_addition(statement, protected) for statement in appended):
+        return False
+
+    base_counts = _body_node_counts(base_tree)
+    snap_counts = _body_node_counts(snap_tree)
+    if any(snap_counts.get(dump, 0) < count for dump, count in base_counts.items()):
+        return False
+    extra = {
+        dump: count - base_counts.get(dump, 0)
+        for dump, count in snap_counts.items()
+        if count > base_counts.get(dump, 0)
+    }
+    if not extra:
+        return False
+    added_counts: dict[str, int] = {}
+    for statement in appended:
+        for dump, count in _node_counts(statement).items():
+            added_counts[dump] = added_counts.get(dump, 0) + count
+    return all(added_counts.get(dump, 0) >= count for dump, count in extra.items())
+
+
+def _new_module_additions_only(snapshot_text: str) -> bool:
+    """A brand-new test module: imports and new-named test definitions only.
+
+    Adding a new test file is what a careful author does after a fix, and the
+    review asked for it not to be a high harness change by itself. A
+    module-level statement (a weakened ``CASES`` table, a monkeypatch, a
+    ``pytestmark``) or a fixture makes it one again.
+    """
+    tree = _parse_module(snapshot_text)
+    if tree is None:
+        return False
+    saw_test = False
+    for index, node in enumerate(tree.body):
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            continue
+        if (
+            index == 0
+            and isinstance(node, ast.Expr)
+            and isinstance(node.value, ast.Constant)
+            and isinstance(node.value.value, str)
+        ):
+            continue  # module docstring
+        if not _is_allowed_addition(node, set()):
+            return False
+        saw_test = True
+    return saw_test
+
+
+def classify_additions(
+    baseline_dir: Path, snapshot_dir: Path, changed: Sequence[str]
+) -> list[str] | None:
+    """The changed paths when every one of them only adds test definitions.
+
+    Covers both spellings of an honest addition: a new test appended to a
+    module the fixture already had, and a brand-new test module. ``None`` when
+    any changed path is anything else (a config file, a ``conftest.py``, a new
+    fixture, a module-level statement, an edited assertion).
+    """
+    base_files = _repo_files(baseline_dir)
+    snap_files = _repo_files(snapshot_dir)
+    added: list[str] = []
+    for rel in changed:
+        if not _TEST_FILE_NAME.match(Path(rel).name):
+            return None
+        base, snap = base_files.get(rel), snap_files.get(rel)
+        if snap is None:
+            return None
+        snap_text = _read_text(snap)
+        if snap_text is None:
+            return None
+        if base is None:
+            if not _new_module_additions_only(snap_text):
+                return None
+        else:
+            base_text = _read_text(base)
+            if base_text is None or not _existing_module_additions_only(
+                base_text, snap_text
+            ):
+                return None
+        added.append(rel)
+    return added
 
 
 def additions_only_test_changes(
     baseline_dir: Path, snapshot_dir: Path, changed: Sequence[str]
 ) -> bool:
-    """Whether every harness change only *adds* to a test module.
+    """Whether every harness change only *appends* tests to an existing module.
 
-    True only when each changed path is a test module that exists on both sides
-    and every top-level function/class it already had is AST-identical in the
-    snapshot. A new conftest, a config file, a removed or renamed module, a
-    touched assertion or a deleted test all make this False.
-
-    This is a downgrade of severity, never a pass: the caller still requires
-    that no node went missing or turned skip/xfail (``compare_node_outcomes``),
-    so "added" cannot mean "replaced".
+    Kept separate from :func:`classify_additions` because it is the narrower
+    claim: a brand-new test module is an addition too, but not one this
+    function vouches for.
     """
     base_files = _repo_files(baseline_dir)
     snap_files = _repo_files(snapshot_dir)
@@ -651,16 +899,74 @@ def additions_only_test_changes(
         base, snap = base_files.get(rel), snap_files.get(rel)
         if base is None or snap is None:
             return False
-        try:
-            base_units = _test_units(base.read_text(encoding="utf-8", errors="replace"))
-            snap_units = _test_units(snap.read_text(encoding="utf-8", errors="replace"))
-        except OSError:
+        base_text, snap_text = _read_text(base), _read_text(snap)
+        if base_text is None or snap_text is None:
             return False
-        if base_units is None or snap_units is None:
-            return False
-        if any(snap_units.get(name) != dump for name, dump in base_units.items()):
+        if not _existing_module_additions_only(base_text, snap_text):
             return False
     return True
+
+
+# --- what the human is shown ------------------------------------------------
+
+# A ``partial`` is approved by a human reading the evidence, so the evidence
+# must be the whole change, not a head of it. The cap only exists so one absurd
+# diff cannot fill a trace; past it the finding is marked truncated and the
+# approval gate refuses the run.
+EVIDENCE_ADDED_LINE_LIMIT = 400
+
+
+def added_lines_evidence(
+    baseline_dir: Path,
+    snapshot_dir: Path,
+    changed: Sequence[str],
+    *,
+    trace_hint: str = "the run trace",
+    limit: int = EVIDENCE_ADDED_LINE_LIMIT,
+) -> tuple[str, bool, dict[str, str]]:
+    """``(evidence, truncated, full_diffs)`` for a set of changed harness files.
+
+    Every added line is shown, line-numbered. When there are more than
+    ``limit``, the evidence says so with the total and where the full diff
+    lives, and ``truncated`` is True — the caller marks the finding so
+    ``pipeline.approve`` refuses it (the review reproduced a 400-character cap
+    hiding ``= lambda: None`` behind three padding tests).
+    """
+    base_files = _repo_files(baseline_dir)
+    snap_files = _repo_files(snapshot_dir)
+    per_file: list[tuple[str, list[tuple[int, str]]]] = []
+    total = 0
+    for rel in sorted(changed):
+        lines = added_lines(
+            _read_text(base_files.get(rel)) or "", _read_text(snap_files.get(rel)) or ""
+        )
+        per_file.append((rel, lines))
+        total += len(lines)
+
+    full_diffs = {
+        rel: "\n".join(f"+{number}: {text}" for number, text in lines)
+        for rel, lines in per_file
+    }
+    truncated = total > limit
+    chunks: list[str] = []
+    shown = 0
+    for rel, lines in per_file:
+        chunks.append(f"--- {rel}: {len(lines)} added line(s)")
+        for number, text in lines:
+            if shown >= limit:
+                break
+            chunks.append(f"+{number}: {text}")
+            shown += 1
+        if shown >= limit and truncated:
+            break
+    evidence = "\n".join(chunks)
+    if truncated:
+        evidence += (
+            f"\n…[truncated: {shown} of {total} added lines shown — approval is refused "
+            f"while the evidence is truncated; the full diff is in {trace_hint} "
+            f"(step 'harness.diff')]"
+        )
+    return evidence, truncated, full_diffs
 
 
 # --- product code that can forge a result -----------------------------------
@@ -929,8 +1235,23 @@ def verify(
         workdir = result.workdir_after
         junit_path = out_root / junit_name
 
-        artifacts, artifact_findings = artifact_paths(workdir, config.artifacts)
-        verifier_findings.extend(artifact_findings)
+        if workdir is None:
+            # The sandbox could not preserve /work (the output copy failed), so
+            # no declared artifact can be looked at. Saying nothing would read
+            # as "every artifact is fine".
+            artifacts: list[Path] = []
+            verifier_findings.append(
+                Finding(
+                    "ARTIFACTS_UNVERIFIED",
+                    MEDIUM,
+                    "the sandbox produced no workspace copy, so declared artifacts "
+                    "were not evaluated",
+                    f"workdir_after=None cleanup_errors={result.cleanup_errors}",
+                )
+            )
+        else:
+            artifacts, artifact_findings = artifact_paths(workdir, config.artifacts)
+            verifier_findings.extend(artifact_findings)
 
         report: EvidenceReport = analyze(
             stdout=result.stdout,
@@ -959,43 +1280,65 @@ def verify(
 
         # What the pristine fixture *did*, node by node. Counting alone cannot
         # tell a full run from a filtered one, and no marker needs to live in a
-        # test file for a node to stop running.
+        # test file for a node to stop running. Without a pristine outcome the
+        # comparison cannot run at all, so skip/xfail is reported as unverified
+        # rather than disappearing into BASELINE_UNAVAILABLE.
         node_findings: list[Finding] = []
+        snapshot_outcomes = node_outcomes(junit_path)
         if baseline.outcomes:
-            node_findings = compare_node_outcomes(
-                baseline.outcomes, node_outcomes(junit_path)
-            )
-            verifier_findings.extend(node_findings)
+            node_findings = compare_node_outcomes(baseline.outcomes, snapshot_outcomes)
+        else:
+            node_findings = unverified_node_outcomes(snapshot_outcomes)
+        verifier_findings.extend(node_findings)
 
-        # The test harness itself must be the one the fixture shipped.
+        # The test harness itself must be the one the fixture shipped. A change
+        # that only *appends* new test definitions is a medium (a human reads
+        # the added lines); anything else is a high harness change.
+        harness_diffs: dict[str, str] = {}
         if baseline_repo is not None:
             changes = harness_changes(baseline_repo, snapshot_dir)
             harness_changed = [rel for rel, _ in changes]
-            if changes and not node_findings and additions_only_test_changes(
-                baseline_repo, snapshot_dir, harness_changed
-            ):
-                # Every pre-existing test unit is untouched and every pristine
-                # node still ran: this only *adds* coverage, which is what an
-                # honest author does after a fix. A human still looks at it.
-                verifier_findings.append(
-                    Finding(
-                        "TESTS_ADDED",
-                        MEDIUM,
-                        "tests were added to existing test modules and no existing "
-                        "test changed: " + ", ".join(harness_changed),
-                        " | ".join(f"{rel}: {diff[:400]}" for rel, diff in changes)[:2000],
-                    )
+            if changes:
+                trace_hint = (
+                    str(Path(junit_keep_path).parent / "trace.jsonl")
+                    if junit_keep_path is not None
+                    else "the run trace"
                 )
-            elif changes:
-                verifier_findings.append(
-                    Finding(
-                        "TEST_HARNESS_CHANGED",
-                        HIGH,
-                        "the test harness differs from the pristine fixture: "
-                        + ", ".join(harness_changed),
-                        " | ".join(f"{rel}: {diff[:400]}" for rel, diff in changes)[:2000],
-                    )
+                evidence, truncated, full_diffs = added_lines_evidence(
+                    baseline_repo, snapshot_dir, harness_changed, trace_hint=trace_hint
                 )
+                if truncated:
+                    harness_diffs = full_diffs
+                added_paths = (
+                    None
+                    if node_findings
+                    else classify_additions(baseline_repo, snapshot_dir, harness_changed)
+                )
+                if added_paths is not None:
+                    # Added tests only, every pristine node still ran: this is
+                    # what an honest author does after a fix. A human still
+                    # reads the added lines before approving.
+                    verifier_findings.append(
+                        Finding(
+                            "TESTS_ADDED",
+                            MEDIUM,
+                            "test definitions were added without touching anything the "
+                            "pristine fixture already had: " + ", ".join(added_paths),
+                            evidence,
+                            truncated=truncated,
+                        )
+                    )
+                else:
+                    verifier_findings.append(
+                        Finding(
+                            "TEST_HARNESS_CHANGED",
+                            HIGH,
+                            "the test harness differs from the pristine fixture by more "
+                            "than added test definitions: " + ", ".join(harness_changed),
+                            evidence,
+                            truncated=truncated,
+                        )
+                    )
             if (
                 baseline.collected is not None
                 and report.counts["collected"] < baseline.collected
@@ -1099,6 +1442,7 @@ def verify(
             junit_path=kept_junit,
             baseline_collected=baseline.collected,
             harness_changes=harness_changed,
+            harness_diffs=harness_diffs,
         )
     finally:
         # The verifier owns every temp tree it made; none outlives the call.

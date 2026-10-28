@@ -163,6 +163,17 @@ def run_pipeline(
             data={"verdict": verdict_data},
         )
 
+        # A truncated finding points the human here for the full diff; this is
+        # the copy the approval gate's refusal refers to.
+        if verdict.harness_diffs:
+            trace.append(
+                "harness.diff",
+                data={
+                    "diffs": verdict.harness_diffs,
+                    "note": "full added lines for evidence truncated in the verdict",
+                },
+            )
+
         results = []
         if run_probes_too:
             results = probes_module.run_probes(probe_limits or probes_module.PROBE_LIMITS)
@@ -214,21 +225,35 @@ def approve(
     written reason**, which is recorded in the trace together with the findings
     the human is overriding. ``verification-failed`` and ``blocked`` stay
     unapprovable: nothing there is a judgement call.
+
+    Two more gates: the run itself must have finished (``pipeline.end`` with
+    status ``ok`` — a run that crashed after its verdict, or that never
+    finished, is not a conclusion), and no finding may carry truncated
+    evidence (a human cannot approve what they were not shown).
     """
     run_dir = Path(runs_root or runs_dir()) / run_id
     trace_path = run_dir / "trace.jsonl"
     if not trace_path.is_file():
         raise FileNotFoundError(f"unknown run: {run_id}")
     summary = summarize(trace_path)
+    if summary.get("status") != "ok":
+        raise PermissionError(
+            f"run {run_id} has pipeline status {summary.get('status')!r}, not 'ok'; "
+            "only a run that reached its own conclusion can be approved"
+        )
     token = summary.get("exit_token")
     if token not in ("done", "partial"):
         raise PermissionError(f"run {run_id} is not approvable (verdict={token!r})")
     reason = (reason or "").strip()
-    codes = [
-        str(finding.get("code"))
-        for finding in (summary.get("findings") or [])
-        if isinstance(finding, dict) and finding.get("code")
-    ]
+    findings = [f for f in (summary.get("findings") or []) if isinstance(f, dict)]
+    codes = [str(f.get("code")) for f in findings if f.get("code")]
+    truncated = [str(f.get("code")) for f in findings if f.get("truncated")]
+    if truncated:
+        raise PermissionError(
+            f"run {run_id} has truncated evidence for {', '.join(truncated)}; the full "
+            f"diff is in {trace_path} (step 'harness.diff') and the run is not "
+            "approvable until the whole change has been read"
+        )
     if token == "partial" and not reason:
         raise PermissionError(
             f"run {run_id} is partial; approving it requires a non-empty reason "

@@ -22,10 +22,22 @@ client = TestClient(app)
 
 
 def make_run(
-    root, token: str, codes: list[str] | None = None, run_id: str = "run-1"
+    root,
+    token: str,
+    codes: list[str] | None = None,
+    run_id: str = "run-1",
+    *,
+    status: str | None = "ok",
+    truncated: bool = False,
 ) -> str:
     trace = Trace(root / run_id / "trace.jsonl", run_id)
     trace.append("fixture.copy", data={})
+    findings = []
+    for code in codes or []:
+        finding = {"code": code, "severity": "medium", "message": "", "evidence": ""}
+        if truncated:
+            finding["truncated"] = True
+        findings.append(finding)
     trace.append(
         "verify",
         data={
@@ -33,14 +45,12 @@ def make_run(
                 "exit_token": token,
                 "first_line": f"exit: {token} — canned",
                 "counts": {"collected": 6, "passed": 6},
-                "findings": [
-                    {"code": code, "severity": "medium", "message": "", "evidence": ""}
-                    for code in (codes or [])
-                ],
+                "findings": findings,
             }
         },
     )
-    trace.append("pipeline.end", data={"status": "ok"})
+    if status is not None:
+        trace.append("pipeline.end", data={"status": status})
     return run_id
 
 
@@ -90,6 +100,37 @@ def test_a_failed_or_blocked_run_is_never_approvable(tmp_path, token):
 
     with pytest.raises(PermissionError):
         pipeline.approve(run_id, runs_root=tmp_path, reason="please")
+
+
+def test_a_run_that_crashed_after_its_verdict_is_not_approvable(tmp_path):
+    """Review L1: a done verdict inside a run that never finished proves nothing."""
+    run_id = make_run(tmp_path, "done", status="failed")
+
+    with pytest.raises(PermissionError) as excinfo:
+        pipeline.approve(run_id, runs_root=tmp_path)
+
+    assert "not 'ok'" in str(excinfo.value)
+
+
+def test_a_run_that_never_finished_is_not_approvable(tmp_path):
+    run_id = make_run(tmp_path, "done", status=None)
+
+    with pytest.raises(PermissionError) as excinfo:
+        pipeline.approve(run_id, runs_root=tmp_path)
+
+    assert "running" in str(excinfo.value)
+
+
+def test_a_finding_with_truncated_evidence_is_not_approvable(tmp_path):
+    """Review M1: a human cannot approve a diff they were not shown."""
+    run_id = make_run(tmp_path, "partial", ["TESTS_ADDED"], truncated=True)
+
+    with pytest.raises(PermissionError) as excinfo:
+        pipeline.approve(run_id, runs_root=tmp_path, reason="read the diff")
+
+    message = str(excinfo.value)
+    assert "truncated" in message
+    assert "harness.diff" in message
 
 
 def _records(root, run_id: str) -> list[dict]:

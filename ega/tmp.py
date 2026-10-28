@@ -32,23 +32,34 @@ ENV_VAR = "EGA_TMPDIR"
 PREFIX = "ega-root-"
 
 _root: Path | None = None
+_cleanup_registered = False
 
 
 def root() -> Path:
-    """This process's temporary root, created on first use and then reused."""
-    global _root
-    if _root is None:
-        parent = os.environ.get(ENV_VAR)
-        if parent:
-            base = Path(parent).expanduser()
-            base.mkdir(parents=True, exist_ok=True)
-            path = Path(
-                tempfile.mkdtemp(prefix=f"{PREFIX}{os.getpid()}-", dir=str(base))
-            )
-        else:
-            path = Path(tempfile.mkdtemp(prefix=PREFIX))
-        _root = path
+    """This process's temporary root, created on first use and reused.
+
+    Re-created when it has vanished (a long-lived process outlives the system
+    tempdir cleaner): a cached path that no longer exists makes every later
+    ``mkdtemp`` fail for the rest of the process, which is what the review saw.
+    The re-created root is registered for removal too — otherwise the process
+    exits leaving the empty replacement behind.
+    """
+    global _root, _cleanup_registered
+    if _root is not None and _root.is_dir():
+        return _root
+    parent = os.environ.get(ENV_VAR)
+    if parent:
+        base = Path(parent).expanduser()
+        base.mkdir(parents=True, exist_ok=True)
+        path = Path(
+            tempfile.mkdtemp(prefix=f"{PREFIX}{os.getpid()}-", dir=str(base))
+        )
+    else:
+        path = Path(tempfile.mkdtemp(prefix=PREFIX))
+    _root = path
+    if not _cleanup_registered:
         atexit.register(_remove_if_empty)
+        _cleanup_registered = True
     return _root
 
 

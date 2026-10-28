@@ -87,7 +87,9 @@ class SandboxResult:
     timed_out: bool
     oom_killed: bool
     isolation: str  # "gvisor" (runsc) | "runc"
-    workdir_after: Path
+    # None when the output copy could not be made at all (the temp root failed);
+    # callers must not assume a directory exists.
+    workdir_after: Path | None
     container_name: str
     error: str | None = None
     # Entries that existed in /work but were refused by the output copy
@@ -112,7 +114,7 @@ class SandboxResult:
             "timed_out": self.timed_out,
             "oom_killed": self.oom_killed,
             "isolation": self.isolation,
-            "workdir_after": str(self.workdir_after),
+            "workdir_after": str(self.workdir_after) if self.workdir_after else None,
             "container_name": self.container_name,
             "error": self.error,
             "excluded_output": list(self.excluded_output),

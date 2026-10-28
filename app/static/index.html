@@ -1,0 +1,219 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Evidence-Gated Agent</title>
+<style>
+  :root {
+    --bg: #0e1116; --panel: #161b22; --line: #30363d; --fg: #e6edf3;
+    --muted: #8b949e; --green: #3fb950; --red: #f85149; --amber: #d29922; --blue: #58a6ff;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg);
+         font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; }
+  header { padding: 20px 24px 8px; border-bottom: 1px solid var(--line); }
+  h1 { font-size: 18px; margin: 0 0 4px; }
+  .pitch { color: var(--muted); font-size: 13px; margin: 0 0 12px; }
+  main { padding: 16px 24px 60px; display: grid; gap: 16px; max-width: 1400px; }
+  section { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 14px 16px; }
+  section > h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .08em;
+                 color: var(--muted); margin: 0 0 10px; }
+  select, button { background: #21262d; color: var(--fg); border: 1px solid var(--line);
+                   border-radius: 6px; padding: 6px 10px; font: inherit; }
+  button { cursor: pointer; }
+  button.primary { background: #238636; border-color: #2ea043; font-weight: 600; }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+  .cols { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  @media (max-width: 900px) { .cols { grid-template-columns: 1fr; } }
+  .token { font-size: 15px; font-weight: 700; }
+  .done { color: var(--green); } .bad { color: var(--red); } .warn { color: var(--amber); }
+  .muted { color: var(--muted); }
+  table { border-collapse: collapse; width: 100%; font-size: 13px; }
+  th, td { text-align: left; padding: 5px 8px; border-bottom: 1px solid var(--line);
+           vertical-align: top; }
+  th { color: var(--muted); font-weight: 500; }
+  code, .mono { font-family: inherit; }
+  .evidence { color: var(--muted); word-break: break-word; }
+  .badge { display: inline-block; padding: 1px 7px; border-radius: 999px;
+           border: 1px solid var(--line); font-size: 12px; }
+  .badge.blocked { color: var(--green); border-color: var(--green); }
+  .badge.allowed { color: var(--red); border-color: var(--red); }
+  .badge.critical { color: var(--red); border-color: var(--red); }
+  .badge.high { color: var(--amber); border-color: var(--amber); }
+  .badge.medium, .badge.warning { color: var(--muted); }
+  ol.timeline { list-style: none; margin: 0; padding: 0; font-size: 13px; }
+  ol.timeline li { padding: 3px 0; border-bottom: 1px dashed var(--line); display: flex; gap: 10px; }
+  ol.timeline .seq { color: var(--muted); width: 32px; flex: none; text-align: right; }
+  .kv { color: var(--muted); }
+  pre { white-space: pre-wrap; word-break: break-word; background: #0b0f14; border: 1px solid var(--line);
+        border-radius: 6px; padding: 8px; max-height: 220px; overflow: auto; margin: 6px 0 0; }
+  #status-line { font-size: 13px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Evidence-Gated Agent</h1>
+  <p class="pitch">An agent may not say "done" until a second, fresh sandbox can prove it — and the green checkmarks that lie are caught.</p>
+  <div class="row">
+    <label class="muted" for="fixture">fixture</label>
+    <select id="fixture"></select>
+    <label class="muted" for="patch">author</label>
+    <select id="patch"></select>
+    <button id="run" class="primary">Run</button>
+    <span id="status-line" class="muted"></span>
+  </div>
+</header>
+
+<main>
+  <div class="cols">
+    <section>
+      <h2>Author claim (what the agent said)</h2>
+      <div id="claim" class="muted">no run yet</div>
+    </section>
+    <section>
+      <h2>Verifier verdict (fresh sandbox)</h2>
+      <div id="verdict" class="muted">no run yet</div>
+    </section>
+  </div>
+
+  <section>
+    <h2>False-green findings</h2>
+    <div id="findings" class="muted">none</div>
+  </section>
+
+  <section>
+    <h2>Containment probes</h2>
+    <div id="probes" class="muted">not run yet</div>
+  </section>
+
+  <section>
+    <h2>Trace timeline</h2>
+    <ol id="timeline" class="timeline"></ol>
+    <div class="row" style="margin-top:10px">
+      <button id="approve" disabled>Approve verdict → would open PR</button>
+      <span id="approve-note" class="muted">approval is only enabled when the verdict is <code>done</code></span>
+    </div>
+  </section>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let fixtures = [];
+let currentRun = null;
+let pollTimer = null;
+
+const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+const tokenClass = (t) => (t === "done" ? "done" : t === "partial" ? "warn" : t ? "bad" : "muted");
+
+async function loadFixtures() {
+  const res = await fetch("/api/fixtures");
+  fixtures = (await res.json()).fixtures;
+  $("fixture").innerHTML = fixtures.map((f) => `<option value="${esc(f.name)}">${esc(f.name)}</option>`).join("");
+  renderPatches();
+}
+
+function renderPatches() {
+  const f = fixtures.find((x) => x.name === $("fixture").value);
+  $("patch").innerHTML = (f ? f.patches : []).map((p) => `<option value="${esc(p)}">scripted:${esc(p)}</option>`).join("");
+}
+
+async function startRun() {
+  $("run").disabled = true;
+  $("status-line").textContent = "starting…";
+  const body = { fixture: $("fixture").value, author: "scripted:" + $("patch").value };
+  const res = await fetch("/api/runs", {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+  });
+  const data = await res.json();
+  if (!res.ok) { $("status-line").textContent = "error: " + (data.detail || res.status); $("run").disabled = false; return; }
+  currentRun = data.run_id;
+  poll();
+}
+
+function poll() {
+  if (!currentRun) return;
+  clearTimeout(pollTimer);
+  pollTimer = setTimeout(async () => {
+    const res = await fetch(`/api/runs/${currentRun}`);
+    const data = await res.json();
+    $("status-line").textContent = `run ${currentRun} — ${data.status}` + (data.error ? ` — ${data.error}` : "");
+    render(data);
+    if (data.status === "queued" || data.status === "running") poll();
+    else $("run").disabled = false;
+  }, 1000);
+}
+
+function render(data) {
+  const s = data.summary || {};
+  const v = s.verdict || {};
+  const claim = s.claim || {};
+
+  $("claim").className = "";
+  $("claim").innerHTML = claim.status
+    ? `<div>status: <span class="token ${tokenClass(claim.status)}">${esc(claim.status)}</span></div>
+       <div>tests claimed passed: <strong>${esc(claim.tests_claimed_passed ?? "—")}</strong></div>
+       <div class="muted">${esc(claim.text || "")}</div>`
+    : `<span class="muted">no claim recorded</span>`;
+
+  $("verdict").className = "";
+  $("verdict").innerHTML = v.first_line
+    ? `<div class="token ${tokenClass(v.exit_token)}">exit: ${esc(v.exit_token)}</div>
+       <div class="muted">${esc(v.sentence || "")}</div>
+       <table>
+         <tr><th>counts</th><td>${Object.entries(v.counts || {}).map(([k, n]) => `${k}=<strong>${n}</strong>`).join(" · ")}</td></tr>
+         <tr><th>isolation</th><td>${esc(v.isolation)}</td></tr>
+         <tr><th>duration</th><td>${esc(v.duration_s)}s</td></tr>
+         <tr><th>command</th><td class="mono">${esc(v.test_command)}</td></tr>
+       </table>`
+    : `<span class="muted">waiting for the verifier…</span>`;
+
+  const findings = s.findings || [];
+  $("findings").className = "";
+  $("findings").innerHTML = findings.length
+    ? `<table><tr><th>code</th><th>severity</th><th>message</th><th>evidence</th></tr>` +
+      findings.map((f) => `<tr>
+        <td><strong>${esc(f.code)}</strong></td>
+        <td><span class="badge ${esc(f.severity)}">${esc(f.severity)}</span></td>
+        <td>${esc(f.message)}</td>
+        <td class="evidence">${esc(f.evidence)}</td></tr>`).join("") + `</table>`
+    : (v.exit_token ? `<span class="done">no findings</span>` : `<span class="muted">none yet</span>`);
+
+  const probes = s.probes || [];
+  $("probes").className = "";
+  $("probes").innerHTML = probes.length
+    ? `<table><tr><th>probe</th><th>result</th><th>evidence</th></tr>` +
+      probes.map((p) => `<tr>
+        <td>${esc(p.name)}</td>
+        <td><span class="badge ${p.blocked ? "blocked" : "allowed"}">${p.blocked ? "blocked" : "ALLOWED"}</span></td>
+        <td class="evidence">${esc(p.evidence)}</td></tr>`).join("") + `</table>`
+    : `<span class="muted">not run yet</span>`;
+
+  $("timeline").innerHTML = (s.steps || []).map((st) =>
+    `<li><span class="seq">${st.seq}</span><span>${esc(st.step)}</span>
+     <span class="muted">${esc(st.status)}${st.exit_code === null ? "" : " exit=" + st.exit_code}</span>
+     <span class="muted">${esc(st.ts || "")}</span></li>`).join("");
+
+  const approved = !!s.approved;
+  $("approve").disabled = !(v.exit_token === "done") || approved;
+  $("approve-note").textContent = approved
+    ? `approved at ${s.approved_at} — recorded in the trace (no external side effect in this phase)`
+    : (v.exit_token === "done" ? "verdict is done — approval allowed" : "approval is only enabled when the verdict is done");
+}
+
+async function approve() {
+  if (!currentRun) return;
+  const res = await fetch(`/api/runs/${currentRun}/approve`, { method: "POST" });
+  const data = await res.json();
+  if (!res.ok) { $("approve-note").textContent = "approval refused: " + (data.detail || res.status); return; }
+  poll();
+}
+
+$("fixture").addEventListener("change", renderPatches);
+$("run").addEventListener("click", startRun);
+$("approve").addEventListener("click", approve);
+loadFixtures();
+</script>
+</body>
+</html>

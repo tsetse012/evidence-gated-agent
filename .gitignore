@@ -1,0 +1,17 @@
+# harness / agent working dirs
+.omc/
+.claude/
+.env*
+
+# python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+
+# run artifacts
+runs/
+
+# tooling
+.pytest_cache/
+.ruff_cache/

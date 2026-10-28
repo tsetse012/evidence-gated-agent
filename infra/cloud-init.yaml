@@ -1,0 +1,108 @@
+#cloud-config
+# Vultr Cloud Compute, Ubuntu 24.04. Provisioning is NOT executed in this phase.
+# Written now so kickoff day is a single `cloud-init` boot.
+package_update: true
+package_upgrade: false
+
+packages:
+  - ca-certificates
+  - curl
+  - git
+  - gnupg
+  - ufw
+  - debian-keyring
+  - debian-archive-keyring
+  - apt-transport-https
+  - python3
+
+write_files:
+  - path: /etc/docker/daemon.json
+    owner: root:root
+    permissions: "0644"
+    content: |
+      {
+        "runtimes": {
+          "runsc": {
+            "path": "/usr/local/bin/runsc"
+          }
+        },
+        "log-driver": "json-file",
+        "log-opts": { "max-size": "10m", "max-file": "3" }
+      }
+
+  - path: /etc/systemd/system/ega.service
+    owner: root:root
+    permissions: "0644"
+    content: |
+      [Unit]
+      Description=Evidence-Gated Agent (FastAPI)
+      After=network-online.target docker.service
+      Wants=network-online.target
+
+      [Service]
+      Type=simple
+      WorkingDirectory=/opt/evidence-gated-agent
+      Environment=EGA_RUNS_DIR=/var/lib/ega/runs
+      Environment=EGA_RUNTIME=runsc
+      ExecStart=/opt/evidence-gated-agent/.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000
+      Restart=always
+      RestartSec=3
+
+      [Install]
+      WantedBy=multi-user.target
+
+  - path: /etc/caddy/Caddyfile
+    owner: root:root
+    permissions: "0644"
+    content: |
+      # Replace :80 with your domain to get automatic TLS.
+      :80 {
+        reverse_proxy 127.0.0.1:8000
+      }
+
+runcmd:
+  # --- Docker (official apt repo) ---
+  - install -m 0755 -d /etc/apt/keyrings
+  - curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+  - chmod a+r /etc/apt/keyrings/docker.asc
+  - >
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc]
+    https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo $VERSION_CODENAME) stable"
+    > /etc/apt/sources.list.d/docker.list
+  - apt-get update -y
+  - DEBIAN_FRONTEND=noninteractive apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin
+
+  # --- gVisor runsc (official release bucket) ---
+  - ARCH=$(uname -m) && curl -fsSL "https://storage.googleapis.com/gvisor/releases/release/latest/${ARCH}/runsc" -o /usr/local/bin/runsc && chmod 0755 /usr/local/bin/runsc
+  - ARCH=$(uname -m) && curl -fsSL "https://storage.googleapis.com/gvisor/releases/release/latest/${ARCH}/containerd-shim-runsc-v1" -o /usr/local/bin/containerd-shim-runsc-v1 && chmod 0755 /usr/local/bin/containerd-shim-runsc-v1
+
+  # --- restart docker so it picks up the runsc runtime ---
+  - systemctl restart docker
+  - docker info --format '{{json .Runtimes}}'
+
+  # --- host firewall ---
+  - ufw allow 22/tcp
+  - ufw allow 80/tcp
+  - ufw allow 443/tcp
+  - ufw --force enable
+
+  # --- app ---
+  - git clone https://github.com/REPLACE_ME/evidence-gated-agent.git /opt/evidence-gated-agent
+  - cd /opt/evidence-gated-agent && curl -LsSf https://astral.sh/uv/install.sh | sh
+  - cd /opt/evidence-gated-agent && /root/.local/bin/uv sync --frozen
+  - cd /opt/evidence-gated-agent && ./scripts/build_image.sh
+  - mkdir -p /var/lib/ega/runs && chmod 0755 /var/lib/ega/runs
+
+  # --- Caddy (automatic TLS when a domain is set) ---
+  - curl -1sLf https://dl.cloudsmith.io/public/caddy/stable/gpg.key | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+  - curl -1sLf https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt > /etc/apt/sources.list.d/caddy-stable.list
+  - apt-get update -y && DEBIAN_FRONTEND=noninteractive apt-get install -y caddy
+
+  # --- smoke test, must print "runsc" in the runtime list ---
+  - docker run --runtime=runsc --rm hello-world
+
+  - systemctl daemon-reload
+  - systemctl enable --now ega.service
+  - systemctl reload caddy
+
+final_message: "Evidence-Gated Agent host ready after $UPTIME seconds."

@@ -1,0 +1,4 @@
+{
+  "expected_min_tests": 6,
+  "description": "invoice totals with tax/discount; one real bug, 6 tests, 2 failing before the fix"
+}

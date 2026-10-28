@@ -1,0 +1,4 @@
+{
+  "expected_min_tests": 3,
+  "description": "tests live in tests/checks_math.py, so pytest collects zero tests"
+}

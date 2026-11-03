@@ -15,6 +15,7 @@ import pytest
 
 from ega.sandbox import (
     UnsafeTreeError,
+    container_user,
     copy_tree,
     make_shared,
     scan_unsafe_entries,
@@ -123,6 +124,23 @@ def test_symlinks_are_copied_as_symlinks(tmp_path):
     assert (dst / "alias.py").is_symlink()
 
 
+def _container_bits(path: Path) -> int:
+    """Permission bits that apply to the user the container runs as.
+
+    ``make_shared`` uses either a chown (the container shares the host uid) or
+    widened bits, so the question is what the container can do, not which of
+    the two paths ran.
+    """
+    uid, gid = container_user()
+    st = os.stat(path)
+    mode = stat.S_IMODE(st.st_mode)
+    if st.st_uid == uid:
+        return (mode >> 6) & 7
+    if st.st_gid == gid:
+        return (mode >> 3) & 7
+    return mode & 7
+
+
 def test_make_shared_makes_a_0700_tree_writable_by_the_container_uid(tmp_path):
     root = tmp_path / "private"
     root.mkdir(mode=0o700)
@@ -133,12 +151,9 @@ def test_make_shared_makes_a_0700_tree_writable_by_the_container_uid(tmp_path):
     problems = make_shared(root)
 
     assert problems == []
-    if os.getuid() != 1000:  # chown succeeds trivially as uid 1000; otherwise chmod widens
-        assert os.stat(root).st_uid == os.getuid()
-        dir_mode = stat.S_IMODE(os.stat(root).st_mode)
-        assert dir_mode & 0o777 == 0o777, f"directory is not reachable: {oct(dir_mode)}"
-        file_mode = stat.S_IMODE(os.stat(root / "file.txt").st_mode)
-        assert file_mode & 0o666 == 0o666, f"file is not writable: {oct(file_mode)}"
+    # w+x on the directory to enter and create entries, r+w on the file.
+    assert _container_bits(root) & 0o3 == 0o3, oct(stat.S_IMODE(os.stat(root).st_mode))
+    assert _container_bits(root / "file.txt") & 0o6 == 0o6
 
 
 def test_make_shared_keeps_the_executable_bit_meaning(tmp_path):
@@ -155,5 +170,16 @@ def test_make_shared_keeps_the_executable_bit_meaning(tmp_path):
 
     make_shared(root)
 
-    assert stat.S_IMODE(os.stat(script).st_mode) & 0o111 == 0o111
-    assert stat.S_IMODE(os.stat(plain).st_mode) & 0o111 == 0
+    assert _container_bits(root) & 0o1 == 0o1
+    assert _container_bits(script) & 0o1 == 0o1
+    assert _container_bits(plain) & 0o1 == 0
+
+
+def test_permissive_mode_widens_files_but_only_marks_executables_executable():
+    """The chmod fallback path's X rule, checked without a failing chown."""
+    from ega import sandbox
+
+    assert sandbox._permissive_mode(stat.S_IFDIR | 0o700) & 0o111 == 0o111
+    assert sandbox._permissive_mode(stat.S_IFREG | 0o700) & 0o111 == 0o111
+    assert sandbox._permissive_mode(stat.S_IFREG | 0o600) & 0o111 == 0
+    assert sandbox._permissive_mode(stat.S_IFREG | 0o600) & 0o666 == 0o666

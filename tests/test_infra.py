@@ -90,3 +90,53 @@ def test_readme_documents_the_smoke_tests():
     readme = (INFRA / "README.md").read_text(encoding="utf-8")
     assert "docker run --runtime=runsc --rm hello-world" in readme
     assert "run_probes" in readme
+
+
+# --- the three failures measured on the VM (2026-11-04) --------------------
+
+
+def _runcmd_lines() -> list[str]:
+    return [str(line) for line in load_cloud_init()["runcmd"]]
+
+
+def test_gvisor_comes_from_the_verified_tarball():
+    """The per-binary URLs under latest/<arch>/ are gone (404, measured 2026-11-04).
+
+    The tarball is the only artifact left, and it carries `gvisor-bin/` — the
+    sentry sidecar without which `docker run --runtime=runsc` cannot create a
+    sandbox at all.
+    """
+    lines = [line for line in _runcmd_lines() if "gvisor" in line]
+    assert lines, "no gVisor install step"
+    text = "\n".join(lines)
+    assert "gvisor.tar.bz2" in text
+    assert "gvisor.tar.bz2.sha512" in text
+    assert any("/latest/${ARCH}/runsc" in line for line in lines) is False, (
+        "the removed per-binary URL must not come back"
+    )
+    assert "gvisor-bin" in text, "the sentry sidecar ships inside the tarball"
+
+
+def test_the_gvisor_checksum_is_verified_before_extraction():
+    """One `&&` chain: a failed checksum can never be followed by an extract."""
+    install = next(
+        line for line in _runcmd_lines() if "gvisor.tar.bz2.sha512" in line and "curl" in line
+    )
+    assert "sha512sum -c" in install
+    assert install.index("sha512sum -c") < install.index("tar -xjf")
+    # ... and the install only counts as done when the sidecar is in place.
+    assert "test -d /usr/local/bin/gvisor-bin" in install
+
+
+def test_caddy_install_keeps_the_caddyfile_we_wrote():
+    """write_files writes /etc/caddy/Caddyfile first, so dpkg hits a conffile prompt."""
+    install = next(line for line in _runcmd_lines() if "caddy" in line and "apt-get install" in line)
+    assert "-o Dpkg::Options::=--force-confold" in install
+
+
+def test_the_service_user_uid_is_not_pinned():
+    """The sandbox runs as the service user (ega.sandbox.container_user), so a
+    host whose uid 1000 is taken (Vultr's `linuxuser`) provisions fine."""
+    text = (INFRA / "cloud-init.yaml").read_text(encoding="utf-8")
+    assert "--uid 1000" not in text
+    assert "ega.sandbox.container_user" in text

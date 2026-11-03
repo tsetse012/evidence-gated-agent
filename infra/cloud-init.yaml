@@ -77,8 +77,13 @@ runcmd:
   - DEBIAN_FRONTEND=noninteractive apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin
 
   # --- gVisor runsc (official release bucket) ---
-  - ARCH=$(uname -m) && curl -fsSL "https://storage.googleapis.com/gvisor/releases/release/latest/${ARCH}/runsc" -o /usr/local/bin/runsc && chmod 0755 /usr/local/bin/runsc
-  - ARCH=$(uname -m) && curl -fsSL "https://storage.googleapis.com/gvisor/releases/release/latest/${ARCH}/containerd-shim-runsc-v1" -o /usr/local/bin/containerd-shim-runsc-v1 && chmod 0755 /usr/local/bin/containerd-shim-runsc-v1
+  # The bucket no longer serves the per-binary URLs under latest/<arch>/ (404
+  # as of 2026-11-04); it serves a signed tarball that carries runsc,
+  # containerd-shim-runsc-v1 and gvisor-bin/ (the sentry sidecar). All three are
+  # required: with only the binary, `docker run --runtime=runsc` fails with
+  # `sidecar "gvisor_sentry" not usable`.
+  # One `&&` chain so a bad checksum can never be followed by an extract.
+  - ARCH=$(uname -m) && cd /tmp && curl -fsSL "https://storage.googleapis.com/gvisor/releases/release/latest/${ARCH}/gvisor.tar.bz2" -o gvisor.tar.bz2 && curl -fsSL "https://storage.googleapis.com/gvisor/releases/release/latest/${ARCH}/gvisor.tar.bz2.sha512" -o gvisor.tar.bz2.sha512 && sha512sum -c gvisor.tar.bz2.sha512 && tar -xjf gvisor.tar.bz2 -C /usr/local/bin && chmod 0755 /usr/local/bin/runsc /usr/local/bin/containerd-shim-runsc-v1 && test -x /usr/local/bin/runsc && test -d /usr/local/bin/gvisor-bin && rm -f gvisor.tar.bz2 gvisor.tar.bz2.sha512
 
   # --- restart docker so it picks up the runsc runtime ---
   - systemctl restart docker
@@ -91,6 +96,10 @@ runcmd:
   - ufw --force enable
 
   # --- dedicated non-root service user (docker group only, no sudo) ---
+  # The sandbox runs its containers as *this* user (ega.sandbox.container_user),
+  # so the files they create through the bind mount belong to ega and every
+  # later cleanup can delete them. No uid is pinned: hosts that already use uid
+  # 1000 for another account (Vultr's `linuxuser`) provision fine.
   - id -u ega >/dev/null 2>&1 || useradd --create-home --shell /usr/sbin/nologin ega
   - usermod -aG docker ega
 
@@ -105,7 +114,10 @@ runcmd:
   # --- Caddy (automatic TLS when a domain is set) ---
   - curl -1sLf https://dl.cloudsmith.io/public/caddy/stable/gpg.key | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
   - curl -1sLf https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt > /etc/apt/sources.list.d/caddy-stable.list
-  - apt-get update -y && DEBIAN_FRONTEND=noninteractive apt-get install -y caddy
+  # `write_files` already wrote /etc/caddy/Caddyfile, so dpkg must keep it
+  # instead of stopping at a conffile prompt (stdin EOF kills noninteractive
+  # installs: measured 2026-11-04).
+  - apt-get update -y && DEBIAN_FRONTEND=noninteractive apt-get install -y -o Dpkg::Options::=--force-confold caddy
 
   # --- smoke test, must print "runsc" in the runtime list ---
   - docker run --runtime=runsc --rm hello-world

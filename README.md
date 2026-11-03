@@ -275,8 +275,10 @@ Known limits, stated rather than hidden:
 ## Containment, concretely
 
 Every run gets: `--network none`, `--memory` = `--memory-swap` (no swap),
-`--cpus`, `--pids-limit`, `--read-only` root with a 64 MB `/tmp` tmpfs,
-`--cap-drop ALL`, `--security-opt no-new-privileges`, `--user 1000:1000`, and a
+`--cpus`, `--pids-limit` (the host cgroup cap), `--ulimit nproc=N:N` (the cap
+the *guest* sees — `--pids-limit` alone does not stop `fork()` inside gVisor),
+`--read-only` root with a 64 MB `/tmp` tmpfs, `--cap-drop ALL`,
+`--security-opt no-new-privileges`, `--user <host uid>:<host gid>`, and a
 single `rw` bind mount of a **copy** of the workspace at `/work`. No host
 environment is forwarded (`docker run` only forwards what `-e` names, and we
 name only `HOME`, `TMPDIR`, `PYTHONDONTWRITEBYTECODE`, `PYTHONUNBUFFERED`, plus
@@ -289,9 +291,10 @@ Two boundaries sit around the mount:
 - **copy boundary** — `copytree(symlinks=True)` both ways. A symlink pointing
   outside its tree, or a FIFO/device/socket, rejects the run on input and is
   dropped-and-reported on output, so no host file is ever read through a link.
-- **ownership boundary** — the copied tree is handed to uid/gid 1000 (chown, or
-  `u+rwX,g+rwX,o+rwX` when chown is not permitted), so a 0700 host tree is not
-  a read-only mount in practice.
+- **ownership boundary** — the copied tree is handed to the container uid (chown,
+  or `u+rwX,g+rwX,o+rwX` when chown is not permitted), so a 0700 host tree is not
+  a read-only mount in practice. That uid is the host process's own, so every
+  file the container writes can be deleted by the run that made it.
 
 Runtime is `runsc` (gVisor) when `docker info` lists it, else `runc`; the
 choice is recorded as `isolation` in every result. `EGA_RUNTIME` overrides it.

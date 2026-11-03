@@ -14,8 +14,10 @@ is not the only way out:
   paths, so both directions refuse them (input: the run is rejected; output:
   the entry is left out and reported).
 * **the ownership boundary** — the copied tree is made readable and writable
-  by the container uid (1000), otherwise a Linux bind mount under a different
-  host user is a read-only mount in practice.
+  by the container uid, otherwise a Linux bind mount under a different host
+  user is a read-only mount in practice. That uid is the host process's own
+  uid (see :func:`container_user`), so the files the container writes stay
+  owned by the process that has to delete them.
 """
 
 from __future__ import annotations
@@ -42,12 +44,39 @@ DOCKER_SKIP_REASON = (
     "docker daemon not available (`docker info` failed); cannot run sandbox tests"
 )
 
+# Fallback sandbox uid/gid: the one the image was built with (`runner`). Used
+# when the host process runs as root, where matching it would mean running the
+# sandbox as root.
 CONTAINER_UID = 1000
 CONTAINER_GID = 1000
 # Optional second mount, used by the verifier for its own junit report. It is a
 # separate, empty host directory — never the workspace — so nothing the author
 # put inside /work can be mistaken for a report this run produced.
 OUT_MOUNT = "/ega-out"
+
+
+def container_user() -> tuple[int, int]:
+    """``(uid, gid)`` the container runs as.
+
+    The container writes through a bind mount and into the verifier's output
+    directory, so every file it creates is owned by *its* uid **on the host**.
+    When that uid is not the host process's, nothing it wrote can be deleted
+    later without root: measured 2026-11-04 on the VM, the containers ran as
+    uid 1000 while the service user was 1001, and 14 temporary directories
+    could not be removed (their contents were uid 1000).
+
+    So on POSIX the sandbox runs as the host process's own uid: the files are
+    ours to remove by construction, on any host, with no provisioning step
+    pinning a uid. Root is the exception — a container must never run as root
+    (that flag is containment, not convenience), and root can delete any file
+    anyway.
+    """
+    if os.name == "posix":
+        uid, gid = os.getuid(), os.getgid()
+        if uid != 0:
+            return uid, gid
+    return CONTAINER_UID, CONTAINER_GID
+
 
 # Container-side environment. This is an allowlist: nothing from the host is
 # forwarded (`docker run` only forwards what `-e` names explicitly).
@@ -255,13 +284,16 @@ def _permissive_mode(mode: int) -> int:
 
 
 def make_shared(root: Path) -> list[str]:
-    """Let uid 1000 read and write ``root`` (bind mounts keep host ownership).
+    """Let the container uid read and write ``root`` (bind mounts keep host ownership).
 
-    ``chown`` first; when it is not permitted (never as a normal user) fall
-    back to permissive bits so the container uid can still work inside the
-    mount. Problems are returned, never swallowed.
+    ``chown`` first — the container runs as the host process's uid, so this
+    normally succeeds and the tree keeps its modes. When chown is refused
+    (e.g. a filesystem that does not allow it), fall back to permissive bits
+    so the container uid can still work inside the mount. Problems are
+    returned, never swallowed.
     """
     problems: list[str] = []
+    uid, gid = container_user()
     root = Path(root)
     targets = [root, *root.rglob("*")]
     for target in targets:
@@ -273,7 +305,7 @@ def make_shared(root: Path) -> list[str]:
         if stat.S_ISLNK(st.st_mode):
             continue
         try:
-            os.chown(target, CONTAINER_UID, CONTAINER_GID)
+            os.chown(target, uid, gid)
             continue
         except OSError:
             pass
@@ -290,6 +322,22 @@ def make_shared(root: Path) -> list[str]:
 # --- docker plumbing --------------------------------------------------------
 
 
+def host_pids_limit(pids_limit: int, runtime: str) -> int:
+    """Value for ``--pids-limit`` (the *host* cgroup cap).
+
+    gVisor keeps its own sentry/gofer tasks in the container's host pids
+    cgroup, so a cap sized for the guest kills the container instead of
+    limiting it: measured 2026-11-04, ``runsc --pids-limit 128`` produced no
+    output at all (exit=2) while ``--pids-limit 128 --ulimit nproc=128``
+    stopped the guest at 127 children with EAGAIN. The guest cap is enforced by
+    RLIMIT_NPROC, which both runtimes honour, so the host cap only needs
+    headroom for the sandbox's own processes.
+    """
+    if runtime == "runsc":
+        return max(4 * pids_limit, 1024)
+    return pids_limit
+
+
 def _docker_args(
     *,
     name: str,
@@ -300,6 +348,7 @@ def _docker_args(
     out_dir: Path | None = None,
 ) -> list[str]:
     env = env or {}
+    uid, gid = container_user()
     args = [
         "docker",
         "run",
@@ -317,7 +366,15 @@ def _docker_args(
         "--cpus",
         str(limits.cpus),
         "--pids-limit",
-        str(limits.pids_limit),
+        str(host_pids_limit(limits.pids_limit, runtime)),
+        # The cap the *guest* sees. `--pids-limit` alone does not limit fork()
+        # inside gVisor (the guest's processes are sentry tasks, not host
+        # tasks): measured 2026-11-04, 400 of 400 forks succeeded under runsc
+        # with --pids-limit 128 and the probe reported fork_bomb "allowed".
+        # RLIMIT_NPROC is enforced by both runtimes, so it is the cap the
+        # fork_bomb probe and test_pid_limit_is_enforced rely on.
+        "--ulimit",
+        f"nproc={limits.pids_limit}:{limits.pids_limit}",
         "--read-only",
         "--tmpfs",
         "/tmp:rw,size=64m",
@@ -326,7 +383,7 @@ def _docker_args(
         "--security-opt",
         "no-new-privileges",
         "--user",
-        f"{CONTAINER_UID}:{CONTAINER_GID}",
+        f"{uid}:{gid}",
         # only /work (and the verifier's own /ega-out) is mounted
         "-v",
         f"{work}:/work",
@@ -364,6 +421,21 @@ def _remove_container(name: str, problems: list[str]) -> None:
         message = (removed.stderr or removed.stdout or "").strip()
         if "No such container" not in message:
             problems.append(f"docker rm -f {name} exited {removed.returncode}: {message}")
+
+
+def _remove_tree(path: Path, problems: list[str]) -> None:
+    """``rmtree`` that records a failure instead of hiding it.
+
+    A temp directory that cannot be removed *is* the leak the gate's leak check
+    reports; ``ignore_errors=True`` here made a real leak look like a clean run
+    (measured 2026-11-04: 14 leftovers, no error anywhere).
+    """
+    try:
+        shutil.rmtree(path)
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        problems.append(f"could not remove {path}: {exc}")
 
 
 def run(
@@ -492,7 +564,7 @@ def run(
             except OSError as exc:
                 cleanup_errors.append(f"output copy failed: {exc}")
             finally:
-                shutil.rmtree(work_root, ignore_errors=True)
+                _remove_tree(work_root, cleanup_errors)
 
     return SandboxResult(
         exit_code=exit_code,

@@ -183,17 +183,20 @@ print("EGA_RESULT " + json.dumps({"attempts": attempts, "found": found,
 """
 
 WRITE_SCRIPT = """\
-import json
+import json, os
 targets = ["/etc/ega_probe", "/usr/ega_probe", "/root/ega_probe"]
 attempts = []
 for path in targets:
     try:
         with open(path, "w") as fh:
             fh.write("probe")
-        attempts.append({"path": path, "outcome": "written"})
     except OSError as exc:
-        attempts.append({"path": path, "outcome": "failed",
-                         "error": f"{type(exc).__name__}: {exc}"})
+        attempts.append({"path": path, "outcome": "failed", "errno": exc.errno,
+                         "error": f"{type(exc).__name__}: {exc}",
+                         "exists": os.path.exists(path)})
+    else:
+        attempts.append({"path": path, "outcome": "written", "errno": None,
+                         "exists": os.path.exists(path)})
 print("EGA_RESULT " + json.dumps({"attempts": attempts}))
 """
 
@@ -340,19 +343,58 @@ def probe_host_secret_read(limits: Limits = PROBE_LIMITS) -> ProbeResult:
     )
 
 
+# A read-only root refuses a write with a different errno per runtime: runc's
+# overlayfs answers EROFS, gVisor's VFS answers EACCES (measured 2026-11-04).
+# Both are the refusal; anything else (ENOENT, ENOSPC) is a different failure
+# and proves nothing about the root.
+WRITE_REFUSAL_ERRNOS = (errno.EROFS, errno.EACCES)
+
+
+def write_verdict(attempts: list[dict]) -> tuple[str, str]:
+    """``(outcome, why)`` for one "write outside /work" observation.
+
+    The bar is "the write failed **and** nothing was created" — not the wording
+    of the failure. A write that failed yet left the file behind is an escape,
+    and a failure for any reason other than a refused permission says nothing
+    about the root being read-only.
+    """
+    written = [a["path"] for a in attempts if a.get("outcome") == "written"]
+    if written:
+        return ALLOWED, f"paths outside /work were written: {written}"
+    appeared = [a["path"] for a in attempts if a.get("exists")]
+    if appeared:
+        return ALLOWED, f"the write failed but the file exists: {appeared}"
+    if not attempts:
+        return UNPROVEN, "the probe reported no attempt"
+    other = [
+        f"{a['path']} ({a.get('error')})"
+        for a in attempts
+        if a.get("errno") not in WRITE_REFUSAL_ERRNOS
+    ]
+    if other:
+        return UNPROVEN, (
+            "the write failed for a reason that is not a refused permission: "
+            + "; ".join(other)
+        )
+    return BLOCKED, "every write outside /work was refused and no file was created"
+
+
 def probe_write_outside_workspace(limits: Limits = PROBE_LIMITS) -> ProbeResult:
     result, payload = _run_script(WRITE_SCRIPT, limits)
     if result.error or payload is None:
         return _unproven("write_outside_workspace", result)
     attempts = payload["attempts"]
-    written = [a for a in attempts if a["outcome"] == "written"]
+    outcome, why = write_verdict(attempts)
     detail = "; ".join(
-        f"{a['path']} -> {a['outcome']}" + (f" ({a['error']})" if a.get("error") else "")
+        f"{a['path']} -> {a['outcome']}"
+        + (f" errno={a['errno']}" if a.get("errno") is not None else "")
+        + (f" exists={a['exists']}" if "exists" in a else "")
+        + (f" ({a['error']})" if a.get("error") else "")
         for a in attempts
     )
     return ProbeResult(
-        "write_outside_workspace", True, ALLOWED if written else BLOCKED,
-        f"{detail} [exit={result.exit_code}]",
+        "write_outside_workspace", True, outcome,
+        f"{detail}; why={why} [exit={result.exit_code}]",
     )
 
 

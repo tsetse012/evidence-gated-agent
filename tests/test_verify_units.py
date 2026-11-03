@@ -8,6 +8,7 @@ is reported even when the run looks green.
 
 from __future__ import annotations
 
+import os
 import shutil
 import textwrap
 from pathlib import Path
@@ -777,12 +778,17 @@ def fake_sandbox(
     baseline_stdout="",
     baseline_exit=0,
     baseline_oom=False,
+    verify_junit_age_s: float | None = None,
 ):
     """Replace ``sandbox.run`` with a canned run; the junit is written for real.
 
     A baseline run is recognised by its report name (``baseline-…``); the
     verifier's own run writes ``junit-…``. Both are real files, so the node
     comparison runs against real XML rather than strings.
+
+    ``verify_junit_age_s`` backdates the snapshot's report, which is how a
+    report not written by this run is simulated: ``/ega-out`` is a fresh
+    directory, so nothing can pre-exist there.
     """
     from ega import verify as verify_module
 
@@ -810,6 +816,10 @@ def fake_sandbox(
                 container_name="ega-fake",
             )
         (Path(out_dir) / name).write_text(verify_junit, encoding="utf-8")
+        if verify_junit_age_s is not None:
+            path = Path(out_dir) / name
+            old = path.stat().st_mtime - verify_junit_age_s
+            os.utime(path, (old, old))
         return SandboxResult(
             exit_code=0, stdout=verify_stdout, stderr="", duration_s=0.01,
             timed_out=False, oom_killed=False, isolation="runc",
@@ -1446,3 +1456,52 @@ def test_an_unclean_baseline_is_not_trusted(tmp_path, monkeypatch, baseline_exit
     assert verdict.baseline_collected is None, verdict.baseline_collected
     assert "BELOW_BASELINE" not in found, verdict.first_line()
     assert verdict.exit_token != "done", verdict.first_line()
+
+
+# --- report freshness (VM, 2026-11-04) ------------------------------------
+#
+# ext4 stamps inodes from a coarse clock that trails time.time() by up to
+# ~1.6 ms (300/300 files on the VM). Comparing the report against a wall-clock
+# start therefore failed every honest run on that host while APFS on the Mac
+# hid the bug; the report is now compared against a marker file stamped by the
+# same filesystem clock.
+
+
+def test_freshness_is_compared_on_the_filesystem_clock(tmp_path):
+    from ega import verify as verify_module
+
+    marker_ns = verify_module.marker_mtime_ns(tmp_path)
+    report = tmp_path / "junit-x.xml"
+    report.write_text("<testsuites/>", encoding="utf-8")
+
+    # The same coarse tick as the marker: written by this run, not stale.
+    os.utime(report, ns=(marker_ns, marker_ns))
+    assert verify_module.junit_is_stale(report, marker_ns) is False
+
+    # Any earlier stamp predates the marker, whatever the clock skew is.
+    os.utime(report, ns=(marker_ns - 1, marker_ns - 1))
+    assert verify_module.junit_is_stale(report, marker_ns) is True
+
+
+def test_a_report_older_than_the_run_marker_is_still_stale(tmp_path, monkeypatch):
+    """The regression the fix must not lose: a report not written by this run."""
+    from ega.verify import Claim, verify
+
+    base = make_repo(tmp_path / "fixture")
+    snap = make_repo(tmp_path / "snapshot")
+    same = _junit(("test_ok", "passed"))
+
+    fake_sandbox(
+        monkeypatch,
+        tmp_path,
+        verify_junit=same,
+        verify_stdout="1 passed in 0.01s",
+        baseline_junit=same,
+        baseline_stdout="1 passed in 0.01s",
+        verify_junit_age_s=60,
+    )
+
+    verdict = verify(snap, Claim(status="done", tests_claimed_passed=1), baseline_dir=base)
+
+    assert "JUNIT_STALE" in codes(verdict.findings), verdict.first_line()
+    assert verdict.exit_token == "verification-failed", verdict.first_line()

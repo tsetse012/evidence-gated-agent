@@ -317,6 +317,64 @@ def test_the_runner_blanks_image_metadata():
     assert sandbox.BASE_CONTAINER_ENV["GPG_KEY"] == ""
 
 
+# --- read-only root (VM, 2026-11-04) --------------------------------------
+#
+# gVisor's VFS refuses a write under a read-only root with EACCES where runc's
+# overlayfs says EROFS. The verdict must follow "the write failed and nothing
+# was created", not the wording — and it must not accept a failed write that
+# still put the file on disk.
+
+
+def test_a_refused_write_with_no_file_is_blocked():
+    attempts = [
+        {"path": "/etc/ega_probe", "outcome": "failed", "errno": errno.EROFS, "exists": False,
+         "error": "OSError: [Errno 30] Read-only file system"},
+        {"path": "/usr/ega_probe", "outcome": "failed", "errno": errno.EROFS, "exists": False,
+         "error": "OSError: [Errno 30] Read-only file system"},
+    ]
+
+    outcome, why = probes.write_verdict(attempts)
+
+    assert outcome == probes.BLOCKED
+    assert "no file was created" in why
+
+
+def test_gvisor_eacces_counts_as_a_refused_write():
+    attempts = [
+        {"path": "/etc/ega_probe", "outcome": "failed", "errno": errno.EACCES, "exists": False,
+         "error": "PermissionError: [Errno 13] Permission denied"},
+    ]
+
+    outcome, _ = probes.write_verdict(attempts)
+
+    assert outcome == probes.BLOCKED
+
+
+def test_a_failed_write_that_left_the_file_is_allowed():
+    """A failed write that still created the file is an escape, not a refusal."""
+    attempts = [
+        {"path": "/etc/ega_probe", "outcome": "failed", "errno": errno.EACCES, "exists": True,
+         "error": "PermissionError: [Errno 13] Permission denied"},
+    ]
+
+    outcome, why = probes.write_verdict(attempts)
+
+    assert outcome == probes.ALLOWED
+    assert "file exists" in why
+
+
+def test_a_write_that_failed_for_another_reason_is_unproven():
+    attempts = [
+        {"path": "/etc/ega_probe", "outcome": "failed", "errno": errno.ENOENT, "exists": False,
+         "error": "FileNotFoundError: [Errno 2] No such file or directory"},
+    ]
+
+    outcome, why = probes.write_verdict(attempts)
+
+    assert outcome == probes.UNPROVEN
+    assert "not a refused permission" in why
+
+
 # --- container-backed integration -----------------------------------------
 
 
@@ -388,6 +446,9 @@ def test_probe_write_targets_are_reported(results):
     probe = next(r for r in results if r.name == "write_outside_workspace")
     assert "/etc/ega_probe" in probe.evidence
     assert "written" not in probe.evidence
+    # Refused *and* absent on every target: the file was never created either.
+    assert probe.evidence.count("exists=False") == 3, probe.evidence
+    assert "errno=" in probe.evidence
 
 
 @pytest.mark.docker

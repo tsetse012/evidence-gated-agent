@@ -9,7 +9,7 @@ not a provisioning project.
 | --- | --- |
 | Ubuntu 24.04 | Vultr Cloud Compute, 4 vCPU / 8 GB |
 | Docker CE | official apt repo (`download.docker.com`) |
-| gVisor `runsc` | `storage.googleapis.com/gvisor/releases/release/latest/<arch>/runsc` |
+| gVisor `runsc` | `storage.googleapis.com/gvisor/releases/release/latest/<arch>/gvisor.tar.bz2` (+ `.sha512`, verified before extraction; the tarball carries `runsc`, `containerd-shim-runsc-v1` and `gvisor-bin/`) |
 | runtime registration | `/etc/docker/daemon.json` → `runtimes.runsc.path` |
 | host firewall | `ufw`: 22, 80, 443 only |
 | app | `/opt/evidence-gated-agent`, `uv sync`, `ega-sandbox:dev` image built |
@@ -51,6 +51,21 @@ set for `ega.service`, so every run records `isolation: gvisor`.
 
 ## Notes / known traps
 
+Measured on a real VM (2026-11-04) — the first version of this provisioning
+failed at all three points, and the file now encodes the fix:
+
+- **gVisor**: the per-binary URLs under `latest/<arch>/` return 404; only the
+  tarball is published. Extract the whole tarball — with just `runsc`,
+  `docker run --runtime=runsc` fails with `sidecar "gvisor_sentry" not usable`
+  because `gvisor-bin/` is missing.
+- **Caddy**: `write_files` writes `/etc/caddy/Caddyfile` before the package is
+  installed, so dpkg stops at a conffile prompt (stdin EOF) even with
+  `DEBIAN_FRONTEND=noninteractive`. The install passes
+  `-o Dpkg::Options::=--force-confold`.
+- **uid**: the sandbox runs its containers as the service user
+  (`ega.sandbox.container_user`), so the files they write stay owned by `ega`
+  and the gate's temp-dir cleanup can remove them. Nothing pins uid 1000 —
+  Vultr images already use it for `linuxuser`.
 - Docker Desktop on the development Mac has no `runsc`, so local runs record
   `isolation: runc`. The gVisor path is only exercised on the VM.
 - `daemon.json` is written as a whole file. On a *fresh* VM that is correct;

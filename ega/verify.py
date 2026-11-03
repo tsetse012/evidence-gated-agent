@@ -12,7 +12,8 @@ The verifier trusts nothing the author controls. Concretely:
   created for this run only, mounted only into the verifier container, under a
   random nonce name — so a pre-planted ``.ega/junit.xml`` is never read. Any
   ``.ega/`` inside the snapshot is deleted before the run, and the report must
-  have been written after the run started (``JUNIT_STALE``);
+  be newer than a marker file written on the *same filesystem clock* just
+  before the run, in a directory the container never sees (``JUNIT_STALE``);
 * the expected tests are not counted, they are **named**: the pristine fixture
   is *executed* in its own sandbox and every node id's outcome is recorded, then
   compared node-for-node against the snapshot's report — a node that is gone
@@ -54,7 +55,6 @@ import itertools
 import os
 import re
 import shutil
-import time
 import tokenize
 import tomllib
 import uuid
@@ -1109,6 +1109,34 @@ def artifact_paths(
     return paths, findings
 
 
+# --- report freshness -------------------------------------------------------
+
+
+def marker_mtime_ns(directory: Path) -> int:
+    """Write a start marker into a host-only directory; return its mtime.
+
+    The report's mtime is compared against *this* file's stamp instead of
+    ``time.time()``. ext4 stamps inodes from a coarse clock that trails
+    ``time.time()`` by up to ~1.6 ms (measured 300/300 on the VM, 2026-11-04),
+    so a report written immediately after the run began was stamped *before* a
+    wall-clock start and an honest run read as ``JUNIT_STALE``. Two files on
+    the same filesystem are stamped by the same clock, so that comparison has
+    no skew.
+
+    ``directory`` must not be the mounted output directory: a marker the
+    author's sandbox can see (and re-stamp) is a value under their control, and
+    the verifier trusts nothing the author controls.
+    """
+    marker = Path(directory) / f"run-marker-{uuid.uuid4().hex}"
+    marker.write_text("started\n", encoding="utf-8")
+    return marker.stat().st_mtime_ns
+
+
+def junit_is_stale(junit_path: Path, marker_ns: int) -> bool:
+    """True when the report predates the marker written just before the run."""
+    return junit_path.stat().st_mtime_ns < marker_ns
+
+
 # --- the pipeline -----------------------------------------------------------
 
 
@@ -1184,6 +1212,7 @@ def verify(
     baseline_repo: Path | None = None
     junit_name = f"junit-{uuid.uuid4().hex[:12]}.xml"
     out_root: Path | None = None
+    marker_dir: Path | None = None
     workdir: Path | None = None
     kept_junit: Path | None = None
     harness_changed: list[str] = []
@@ -1223,7 +1252,10 @@ def verify(
             if baseline.finding is not None:
                 verifier_findings.append(baseline.finding)
 
-        started = time.time()
+        # Written immediately before the run, outside the directory the
+        # container sees: the report must be newer than this marker.
+        marker_dir = tmp.mkdtemp("ega-marker-")
+        marker_ns = marker_mtime_ns(marker_dir)
         result = sandbox.run(
             verifier_command(junit_name),
             snapshot_dir,
@@ -1261,22 +1293,23 @@ def verify(
             expected_min_tests=expected_min_tests,
             skip_ratio_threshold=skip_ratio_threshold,
             artifacts=artifacts,
-            run_started=started,
+            # Same marker as the report: the artifact check shares the report's
+            # clock instead of a wall clock the filesystem may trail.
+            run_started=marker_ns / 1e9,
             oom_killed=result.oom_killed,
         )
 
         # Freshness: the report must have been produced by this run.
-        if junit_path.is_file():
-            mtime = junit_path.stat().st_mtime
-            if mtime < started:
-                verifier_findings.append(
-                    Finding(
-                        "JUNIT_STALE",
-                        CRITICAL,
-                        "the junit report predates this run; it was not written by the verifier",
-                        f"{junit_path} mtime={mtime:.0f} < run_start={started:.0f}",
-                    )
+        if junit_path.is_file() and junit_is_stale(junit_path, marker_ns):
+            verifier_findings.append(
+                Finding(
+                    "JUNIT_STALE",
+                    CRITICAL,
+                    "the junit report predates this run; it was not written by the verifier",
+                    f"{junit_path} mtime_ns={junit_path.stat().st_mtime_ns} "
+                    f"< run_marker_ns={marker_ns}",
                 )
+            )
 
         # What the pristine fixture *did*, node by node. Counting alone cannot
         # tell a full run from a filtered one, and no marker needs to live in a
@@ -1450,5 +1483,7 @@ def verify(
             shutil.rmtree(workdir, ignore_errors=True)
         if out_root is not None:
             shutil.rmtree(out_root, ignore_errors=True)
+        if marker_dir is not None:
+            shutil.rmtree(marker_dir, ignore_errors=True)
         if baseline_repo is not None:
             shutil.rmtree(baseline_repo, ignore_errors=True)

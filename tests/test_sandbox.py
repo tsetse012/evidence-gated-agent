@@ -7,6 +7,7 @@ the pure helpers behind them are unit-tested in ``test_copy_boundary.py``.
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import textwrap
@@ -137,10 +138,37 @@ def test_run_records_isolation_and_workdir_after(tmp_path):
 
 
 def test_read_only_root_blocks_writes_outside_work(tmp_path):
+    """Every write outside /work is refused **and** leaves no file behind.
+
+    The wording is runtime-specific — runc's overlayfs says EROFS, gVisor's VFS
+    says EACCES (measured 2026-11-04) — so both refusals are accepted and the
+    real bar is that nothing appeared.
+    """
     src = make_src(tmp_path)
-    result = run(["sh", "-c", "echo x > /etc/x"], src, Limits())
-    assert result.exit_code != 0
-    assert "Read-only file system" in (result.stderr + result.stdout)
+    script = textwrap.dedent(
+        """
+        for p in /etc/ega_probe /usr/ega_probe /root/ega_probe; do
+          msg=$( (echo x > "$p") 2>&1 )
+          if [ $? -eq 0 ]; then
+            echo "WROTE $p"
+          elif [ -e "$p" ]; then
+            echo "APPEARED $p"
+          else
+            case "$msg" in
+              *"Read-only file system"*|*"Permission denied"*) echo "REFUSED $p ($msg)" ;;
+              *) echo "OTHER $p ($msg)" ;;
+            esac
+          fi
+        done
+        """
+    )
+    result = run(["sh", "-c", script], src, Limits())
+    assert result.exit_code == 0, result.stderr
+    for path in ("/etc/ega_probe", "/usr/ega_probe", "/root/ega_probe"):
+        assert f"REFUSED {path}" in result.stdout, result.stdout
+    assert "WROTE" not in result.stdout, result.stdout
+    assert "APPEARED" not in result.stdout, result.stdout
+    assert "OTHER" not in result.stdout, result.stdout
 
 
 def test_host_environment_does_not_pass_through(tmp_path, monkeypatch):
@@ -208,5 +236,12 @@ def test_pid_limit_is_enforced(tmp_path):
     src = make_src(tmp_path, {"forker.py": script})
     result = run(["python", "forker.py"], src, Limits(pids_limit=32, timeout_s=60))
     assert result.exit_code == 0, result.stderr
-    assert "failure" in result.stdout
-    assert "failure None" not in result.stdout
+    match = re.search(r"children (\d+) failure (.+)", result.stdout)
+    assert match, result.stdout
+    children = int(match.group(1))
+    failure = match.group(2).strip()
+    # The same expectation on every runtime: the fork is refused at the cap.
+    # (gVisor used to fork past it freely because `--pids-limit` only caps the
+    # host cgroup; the guest limit is RLIMIT_NPROC = `--ulimit nproc`.)
+    assert children < 32, f"{children} children were created past a 32-process cap"
+    assert "BlockingIOError" in failure or "Resource temporarily unavailable" in failure, failure

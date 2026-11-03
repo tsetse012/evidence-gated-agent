@@ -205,6 +205,7 @@ function render(data) {
          <tr><th>isolation</th><td>${esc(v.isolation)}</td></tr>
          <tr><th>duration</th><td>${esc(v.duration_s)}s</td></tr>
          <tr><th>command</th><td class="mono">${esc(v.test_command)}</td></tr>
+         ${s.llm && s.llm.external ? `<tr><th>red-team author</th><td>safety-tuning removed (abliterated) · external endpoint · not part of the product path — the judge and explanation stay on Vultr</td></tr>` : ""}
          ${s.llm ? `<tr><th>llm</th><td>${esc(s.llm.model)} · ${esc(s.llm.calls)} calls · ${esc(s.llm.tool_calls)} tool calls · $${Number(s.llm.cost_usd || 0).toFixed(4)}${s.llm.budget_usd ? ` of $${Number(s.llm.budget_usd).toFixed(2)} cap` : ""}</td></tr>` : ""}
        </table>`
     : `<span class="muted">waiting for the verifier…</span>`;

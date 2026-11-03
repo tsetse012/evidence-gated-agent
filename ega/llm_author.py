@@ -33,6 +33,7 @@ import os
 import re
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 from dataclasses import dataclass, field
@@ -227,14 +228,36 @@ class VultrChatClient:
     def __repr__(self) -> str:
         return f"VultrChatClient(model={self.model!r}, base_url={self.base_url!r})"
 
+    @property
+    def endpoint_host(self) -> str:
+        return urllib.parse.urlparse(self.base_url).hostname or ""
+
+    @property
+    def external(self) -> bool:
+        """True when the author is not served by Vultr Inference.
+
+        Only the red-team demo author uses this: the product path (author,
+        judge, explanation) stays on Vultr, and an external author is labelled
+        as such in the trace and the UI rather than passed off as the product.
+        """
+        return self.endpoint_host != urllib.parse.urlparse(DEFAULT_BASE_URL).hostname
+
     @classmethod
     def from_env(cls, environ: dict | None = None, **kwargs) -> "VultrChatClient":
         environ = os.environ if environ is None else environ
+        model = environ.get("EGA_LLM_MODEL") or DEFAULT_MODEL
+        # An explicit red-team endpoint needs both values; half a configuration
+        # is refused rather than silently falling back to Vultr.
+        author_base = environ.get("EGA_AUTHOR_BASE_URL", "")
+        author_key = environ.get("EGA_AUTHOR_API_KEY", "")
+        if author_base or author_key:
+            if not (author_base and author_key):
+                raise LlmError("EGA_AUTHOR_BASE_URL and EGA_AUTHOR_API_KEY must be set together")
+            return cls(author_key, base_url=author_base, model=model, **kwargs)
         api_key = environ.get("VULTR_INFERENCE_API_KEY", "")
         if not api_key:
             raise LlmError("VULTR_INFERENCE_API_KEY is not set")
         base_url = environ.get("VULTR_INFERENCE_BASE_URL") or DEFAULT_BASE_URL
-        model = environ.get("EGA_LLM_MODEL") or DEFAULT_MODEL
         return cls(api_key, base_url=base_url, model=model, **kwargs)
 
     def complete(
@@ -523,6 +546,8 @@ class LLMAuthor:
         self.prompt_price = prompt_price
         self.completion_price = completion_price
         self.model = getattr(client, "model", "unknown")
+        self.external = bool(getattr(client, "external", False))
+        self.endpoint_host = str(getattr(client, "endpoint_host", "") or "")
 
     def __repr__(self) -> str:
         return f"LLMAuthor(model={self.model!r})"
@@ -554,6 +579,8 @@ class LLMAuthor:
             data={
                 "author": self.name,
                 "model": self.model,
+                "external": self.external,
+                "endpoint_host": self.endpoint_host,
                 "max_turns": self.max_turns,
                 "max_tokens": self.max_tokens,
                 "wall_clock_s": self.wall_clock_s,

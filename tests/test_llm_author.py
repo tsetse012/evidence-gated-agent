@@ -431,6 +431,52 @@ def test_the_api_key_never_lands_in_the_trace(tmp_path, monkeypatch):
     assert claim.status == "done"
     assert sentinel not in trace.path.read_text(encoding="utf-8")
 
+# --- red-team author: an external endpoint is opt-in and always labelled ----
+
+def test_the_default_author_is_vultr_and_not_external():
+    client = VultrChatClient.from_env({"VULTR_INFERENCE_API_KEY": "k"})
+    assert client.endpoint_host == "api.vultrinference.com"
+    assert client.external is False
+
+
+def test_an_external_author_needs_both_its_url_and_its_key():
+    env = {"VULTR_INFERENCE_API_KEY": "k", "EGA_AUTHOR_BASE_URL": "https://redteam.example/v1"}
+    with pytest.raises(LlmError):
+        VultrChatClient.from_env(env)
+    with pytest.raises(LlmError):
+        VultrChatClient.from_env({"VULTR_INFERENCE_API_KEY": "k", "EGA_AUTHOR_API_KEY": "x"})
+
+
+def test_an_external_author_uses_its_own_key_and_is_marked_external():
+    client = VultrChatClient.from_env(
+        {
+            "VULTR_INFERENCE_API_KEY": "vultr-key",
+            "EGA_AUTHOR_BASE_URL": "https://redteam.example/v1",
+            "EGA_AUTHOR_API_KEY": "redteam-key",
+            "EGA_LLM_MODEL": "some-abliterated-model",
+        }
+    )
+    assert client.external is True
+    assert client.endpoint_host == "redteam.example"
+    assert client.model == "some-abliterated-model"
+    assert client._api_key == "redteam-key"
+
+
+def test_the_trace_summary_says_when_the_author_was_external(tmp_path):
+    class ExternalFake(FakeClient):
+        external = True
+        endpoint_host = "redteam.example"
+
+    final = '{"status": "done", "tests_claimed_passed": 0, "text": "ok"}'
+    trace = Trace(tmp_path / "trace.jsonl", "run-1")
+    LLMAuthor(ExternalFake([response(final)]), trace=trace, runner=FakeRunner()).work("x", tmp_path)
+    assert summarize(trace.path)["llm"]["external"] is True
+
+    plain = Trace(tmp_path / "plain.jsonl", "run-2")
+    LLMAuthor(FakeClient([response(final)]), trace=plain, runner=FakeRunner()).work("x", tmp_path)
+    assert summarize(plain.path)["llm"]["external"] is False
+
+
 # --- the API and the page ---------------------------------------------------
 
 def test_the_api_accepts_the_llm_author():

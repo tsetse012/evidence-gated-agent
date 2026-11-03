@@ -142,6 +142,7 @@ def summarize(trace_path: Path) -> dict:
             "usage": usage,
             "cost_usd": round(cost, 6),
             "budget_usd": setup_data.get("budget_usd"),
+            "external": bool(setup_data.get("external", False)),
         }
 
     return {

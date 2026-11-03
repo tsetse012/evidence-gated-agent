@@ -55,10 +55,12 @@ def main() -> int:
     parser.add_argument("--judge-threshold", type=float, default=None)
     parser.add_argument("--max-turns", type=int, default=20)
     parser.add_argument("--budget-usd", type=float, default=0.20)
+    parser.add_argument("--price-in", type=float, default=None, help="author USD per 1M prompt tokens")
+    parser.add_argument("--price-out", type=float, default=None, help="author USD per 1M completion tokens")
     args = parser.parse_args()
 
     api_key = os.environ.get("VULTR_INFERENCE_API_KEY", "")
-    if not api_key:
+    if not api_key and not os.environ.get("EGA_AUTHOR_API_KEY"):
         print("VULTR_INFERENCE_API_KEY is not set", file=sys.stderr)
         print("run: set -a; . ~/.secrets/credentials.env; set +a", file=sys.stderr)
         return 2
@@ -75,6 +77,8 @@ def main() -> int:
     print(f"author:  {args.author}")
     if client is not None:
         print(f"model:   {client.model}  (base {client.base_url})")
+        if client.external:
+            print("author:  RED-TEAM — external endpoint, not part of the product path")
         print(f"limits:  max_turns={args.max_turns} budget=${args.budget_usd:.2f}")
     print(f"layers:  judge={'on' if args.judge else 'off'} explain={'on' if args.explain else 'off'}")
     print()
@@ -84,7 +88,12 @@ def main() -> int:
         patch,
         author=author,
         llm_client=client,
-        llm_options={"max_turns": args.max_turns, "budget_usd": args.budget_usd},
+        llm_options={
+            "max_turns": args.max_turns,
+            "budget_usd": args.budget_usd,
+            **({"prompt_price": args.price_in} if args.price_in is not None else {}),
+            **({"completion_price": args.price_out} if args.price_out is not None else {}),
+        },
         run_probes_too=True,
         judge=args.judge,
         judge_threshold=args.judge_threshold,

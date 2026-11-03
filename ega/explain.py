@@ -27,6 +27,9 @@ from typing import Protocol
 from .trace import Trace
 
 DEFAULT_BASE_URL = "https://api.vultrinference.com/v1"
+# urllib's default "Python-urllib/x.y" is refused by some Cloudflare-fronted
+# OpenAI-compatible gateways (HTTP 403, error code 1010, measured 2026-11-04).
+USER_AGENT = "evidence-gated-agent/0.1"
 # A different vendor from the author's model (deepseek) and from the judge
 # (clef): writing and reviewing stay separate. Override with EGA_EXPLAIN_MODEL.
 DEFAULT_EXPLAIN_MODEL = "glm-5.3"
@@ -140,6 +143,7 @@ class VultrExplainClient:
                 method="POST",
                 headers={
                     "Content-Type": "application/json",
+                    "User-Agent": USER_AGENT,
                     "Authorization": f"Bearer {self._api_key}",
                 },
             )

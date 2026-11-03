@@ -48,6 +48,9 @@ from .verify import Claim
 
 DEFAULT_MODEL = "deepseek-v4.1-flash-1017"
 DEFAULT_BASE_URL = "https://api.vultrinference.com/v1"
+# urllib's default "Python-urllib/x.y" is refused by some Cloudflare-fronted
+# OpenAI-compatible gateways (HTTP 403, error code 1010, measured 2026-11-04).
+USER_AGENT = "evidence-gated-agent/0.1"
 # GET /models on 2026-11-04: deepseek-v4.1-flash-1017 costs $0.15 per million
 # prompt tokens and $0.60 per million completion tokens. The cost cap is only
 # as good as these two numbers; they are read from the API's own usage block.
@@ -280,6 +283,7 @@ class VultrChatClient:
                 method="POST",
                 headers={
                     "Content-Type": "application/json",
+                    "User-Agent": USER_AGENT,
                     "Authorization": f"Bearer {self._api_key}",
                 },
             )

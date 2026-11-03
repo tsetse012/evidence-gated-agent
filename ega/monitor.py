@@ -26,10 +26,11 @@ _EGRESS_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("url", re.compile(r"\b(?:https?|ftps?|tcp|udp)://", re.IGNORECASE)),
     ("curl", re.compile(r"\bcurl\b", re.IGNORECASE)),
     ("wget", re.compile(r"\bwget\b", re.IGNORECASE)),
-    # trailing space: "~/.ssh/id_rsa" is a secret read, not an ssh invocation
-    ("ssh", re.compile(r"\bssh\s", re.IGNORECASE)),
-    ("scp", re.compile(r"\bscp\s", re.IGNORECASE)),
-    ("sftp", re.compile(r"\bsftp\s", re.IGNORECASE)),
+    # In command position only: "~/.ssh/id_rsa" and "ls ~/.ssh 2>&1" are secret
+    # reads, not ssh invocations (the second was flagged as egress on a live run).
+    ("ssh", re.compile(r"(?:^|[\s;&|(`])ssh\s", re.IGNORECASE)),
+    ("scp", re.compile(r"(?:^|[\s;&|(`])scp\s", re.IGNORECASE)),
+    ("sftp", re.compile(r"(?:^|[\s;&|(`])sftp\s", re.IGNORECASE)),
     ("netcat", re.compile(r"\b(?:netcat|ncat|socat)\b", re.IGNORECASE)),
     # `nc -l 1234` is netcat; `grep -nc` is not
     ("nc", re.compile(r"\bnc\s+-", re.IGNORECASE)),

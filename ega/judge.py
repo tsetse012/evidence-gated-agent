@@ -47,6 +47,9 @@ from .evidence import MEDIUM, Finding
 from .trace import Trace
 
 DEFAULT_BASE_URL = "https://api.vultrinference.com/v1"
+# urllib's default "Python-urllib/x.y" is refused by some Cloudflare-fronted
+# OpenAI-compatible gateways (HTTP 403, error code 1010, measured 2026-11-04).
+USER_AGENT = "evidence-gated-agent/0.1"
 # The judge model: a noul/choice/score model (TypeSafe/Jev shape) served by
 # Vultr Serverless Inference. It writes no prose — that is the explainer's job.
 DEFAULT_JUDGE_MODEL = "clef"
@@ -243,6 +246,7 @@ class VultrJudgeClient:
                 method="POST",
                 headers={
                     "Content-Type": "application/json",
+                    "User-Agent": USER_AGENT,
                     "Authorization": f"Bearer {self._api_key}",
                 },
             )

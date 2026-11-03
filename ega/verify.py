@@ -75,6 +75,7 @@ from .evidence import (
     node_outcomes,
     verdict_token,
 )
+from .judge import Judge, JudgeReport, JudgeTarget
 from .sandbox import Limits, SandboxResult
 
 CONFIG_FILE = "ega.toml"
@@ -202,6 +203,9 @@ class Verdict:
     # Full added lines for evidence that had to be truncated; the pipeline keeps
     # them in the trace step the evidence points at.
     harness_diffs: dict[str, str] = field(default_factory=dict)
+    # The judge layer's signal, when it was enabled. Its findings are already in
+    # ``findings``; this is the per-file question/probability record.
+    judge: JudgeReport | None = None
 
     def first_line(self) -> str:
         return f"exit: {self.exit_token} — {self.sentence}"
@@ -220,6 +224,7 @@ class Verdict:
             "junit_path": str(self.junit_path) if self.junit_path else None,
             "baseline_collected": self.baseline_collected,
             "harness_changes": list(self.harness_changes),
+            "judge": self.judge.as_dict() if self.judge is not None else None,
             "sandbox": self.sandbox.as_dict(),
         }
 
@@ -1075,6 +1080,60 @@ def suspicious_product_code(
     )
 
 
+# --- what the judge layer is asked about ------------------------------------
+
+# One changed file's diff is clipped for the judge request: the question is
+# about the shape of the change, not about reading a whole rewrite, and the
+# state budget is finite. The full diff stays in the run's own evidence.
+JUDGE_DIFF_LIMIT = 8000
+
+
+def _file_diff(baseline_path: Path | None, snapshot_path: Path | None, rel: str) -> str:
+    left = _read_text(baseline_path) or ""
+    right = _read_text(snapshot_path) or ""
+    if left == right:
+        return ""
+    diff = "".join(
+        difflib.unified_diff(
+            left.splitlines(keepends=True),
+            right.splitlines(keepends=True),
+            fromfile=f"pristine/{rel}",
+            tofile=f"snapshot/{rel}",
+            n=3,
+        )
+    )
+    if len(diff) > JUDGE_DIFF_LIMIT:
+        diff = diff[:JUDGE_DIFF_LIMIT] + f"\n…[truncated {len(diff) - JUDGE_DIFF_LIMIT} chars]"
+    return diff
+
+
+def judge_targets(baseline_dir: Path, snapshot_dir: Path) -> list[JudgeTarget]:
+    """One target per changed file the judge has a question about.
+
+    Two kinds only, because only two questions exist: a harness file (tests,
+    conftest, pytest config, anything that can shadow pytest) is asked whether
+    the diff weakens the suite; a non-harness Python file is asked whether it
+    special-cases the tests' inputs. Anything else that changed — a README, a
+    data file — is not something either question can answer, and asking anyway
+    would spend a request to produce noise.
+    """
+    base = _repo_files(baseline_dir)
+    snap = _repo_files(snapshot_dir)
+    targets: list[JudgeTarget] = []
+    for rel in sorted(set(base) | set(snap)):
+        if _is_harness_path(Path(rel)):
+            kind = "tests"
+        elif rel.endswith(".py"):
+            kind = "product"
+        else:
+            continue
+        diff = _file_diff(base.get(rel), snap.get(rel), rel)
+        if not diff:
+            continue
+        targets.append(JudgeTarget(path=rel, kind=kind, diff=diff))
+    return targets
+
+
 # --- declared artifacts -----------------------------------------------------
 
 
@@ -1150,8 +1209,14 @@ def verify(
     run_id: str | None = None,
     skip_ratio_threshold: float = 0.2,
     junit_keep_path: Path | None = None,
+    judge: Judge | None = None,
 ) -> Verdict:
-    """Re-run the snapshot's tests in a brand-new sandbox and judge the claim."""
+    """Re-run the snapshot's tests in a brand-new sandbox and judge the claim.
+
+    ``judge`` is the optional judge layer (:mod:`ega.judge`). It is off by
+    default; when supplied it can only *append* medium findings after every
+    deterministic check has run, so it can never raise a verdict.
+    """
     snapshot_dir = Path(snapshot_dir).resolve()
     if not snapshot_dir.is_dir():
         raise FileNotFoundError(f"snapshot_dir does not exist: {snapshot_dir}")
@@ -1216,6 +1281,7 @@ def verify(
     workdir: Path | None = None
     kept_junit: Path | None = None
     harness_changed: list[str] = []
+    judge_report: JudgeReport | None = None
     try:
         # A fresh, author-free view of the pristine fixture: the same repo the
         # author was handed. Without it nothing about the baseline can be shown.
@@ -1390,6 +1456,20 @@ def verify(
             if product_finding is not None:
                 verifier_findings.append(product_finding)
 
+        # The judge layer runs last, on top of every deterministic finding.
+        # It only appends medium findings, so a `verification-failed` stays
+        # `verification-failed` and a `done` can only drop to `partial`. With no
+        # baseline there is nothing to diff: that is reported, never skipped —
+        # an unanswered question must not share a value with a clean answer.
+        if judge is not None:
+            if baseline_repo is None:
+                judge_report = judge.evaluate(
+                    [], reason="no pristine baseline, so no changed file could be diffed"
+                )
+            else:
+                judge_report = judge.evaluate(judge_targets(baseline_repo, snapshot_dir))
+            verifier_findings.extend(judge_report.findings)
+
         # Anything the container left behind that cannot be copied out safely.
         if result.excluded_output:
             verifier_findings.append(
@@ -1476,6 +1556,7 @@ def verify(
             baseline_collected=baseline.collected,
             harness_changes=harness_changed,
             harness_diffs=harness_diffs,
+            judge=judge_report,
         )
     finally:
         # The verifier owns every temp tree it made; none outlives the call.

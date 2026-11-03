@@ -77,6 +77,39 @@ def build_llm_author(trace: Trace, client=None, options: dict | None = None):
     return LLMAuthor(client, trace=trace, **(options or {}))
 
 
+def build_judge(trace: Trace, client=None, *, threshold: float | None = None):
+    """The judge layer, off unless asked for; ``client=None`` reads the env.
+
+    A missing key is not an error here: the layer is built with no client and
+    reports ``JUDGE_UNAVAILABLE``, which keeps the run out of ``done``. Failing
+    the run instead would lose the deterministic verdict a human still wants.
+    """
+    from .judge import JUDGE_THRESHOLD, Judge, JudgeError, VultrJudgeClient
+
+    if client is None:
+        try:
+            client = VultrJudgeClient.from_env()
+        except JudgeError:
+            client = None
+    return Judge(
+        client=client,
+        threshold=JUDGE_THRESHOLD if threshold is None else threshold,
+        trace=trace,
+    )
+
+
+def build_explainer(trace: Trace, client=None):
+    """The explanation client (a different vendor's chat model), injectable."""
+    from .explain import ExplainError, Explainer, VultrExplainClient
+
+    if client is None:
+        try:
+            client = VultrExplainClient.from_env()
+        except ExplainError:
+            client = None
+    return Explainer(client=client, trace=trace)
+
+
 def run_pipeline(
     fixture: str,
     patch: str | None = None,
@@ -89,12 +122,23 @@ def run_pipeline(
     limits: Limits | None = None,
     probe_limits: Limits | None = None,
     run_probes_too: bool = True,
+    judge: bool = False,
+    judge_client=None,
+    judge_threshold: float | None = None,
+    explain: bool = False,
+    explain_client=None,
 ) -> dict:
     """Author -> snapshot -> fresh verifier -> containment probes.
 
     ``author`` is ``"scripted"`` (a canned patch, needs ``patch``) or ``"llm"``
     (a chat model driving three sandboxed tools; ``llm_client`` is the seam the
     tests fake, so the suite never needs the network).
+
+    ``judge`` enables the judge layer (one model question per changed file,
+    medium findings only — it cannot raise a verdict). ``explain`` asks a
+    different vendor's chat model to describe the finished verdict in words;
+    the verdict is not touched. Both are off by default so every existing
+    offline verdict is unchanged.
     """
     meta = fixture_meta(fixture)
     if author == "scripted":
@@ -169,6 +213,9 @@ def run_pipeline(
         # The pristine fixture is the baseline the verifier compares against;
         # the junit report is written outside the workspace and kept here.
         verify_junit = run_dir / "verify_junit.xml"
+        judge_layer = (
+            build_judge(trace, judge_client, threshold=judge_threshold) if judge else None
+        )
         verdict = verify(
             snapshot_dir,
             claim,
@@ -177,6 +224,7 @@ def run_pipeline(
             limits=limits,
             run_id=f"{run_id}-b",
             junit_keep_path=verify_junit,
+            judge=judge_layer,
         )
         # Keep the junit report inside the run dir so the trace stays auditable.
         verdict_data = verdict.as_dict()
@@ -204,6 +252,12 @@ def run_pipeline(
                 },
             )
 
+        # The explanation is generated *after* the verdict is final and never
+        # feeds back into it: a failed call leaves text empty with the reason.
+        explanation = None
+        if explain:
+            explanation = build_explainer(trace, explain_client).explain(verdict.as_dict())
+
         results = []
         if run_probes_too:
             results = probes_module.run_probes(probe_limits or probes_module.PROBE_LIMITS)
@@ -229,6 +283,7 @@ def run_pipeline(
             "trace_path": str(trace_path),
             "verdict": verdict.as_dict(),
             "claim": claim.as_dict(),
+            "explanation": explanation.as_dict() if explanation is not None else None,
         }
     except BaseException as exc:
         trace.append(

@@ -32,6 +32,21 @@ def test_the_probe_panel_has_a_not_proven_state():
     assert 'const probeOutcome = (p) => (p.outcome in OUTCOME_LABELS ? p.outcome : "unproven")' in page
 
 
+def test_the_judge_and_explanation_panels_are_labelled_as_non_decisive():
+    """The page must not let prose read as evidence.
+
+    The judge panel says it can only add findings; the explanation header names
+    its model and says it does not affect the verdict.
+    """
+    page = client.get("/").text
+
+    assert 'id="judge"' in page and 'id="explain"' in page
+    assert "Judge model signal (adds findings — it cannot remove any)" in page
+    assert "it can only add findings; it cannot remove one or raise the verdict" in page
+    assert 'Explanation (${e.model || "no model"}, does not affect the verdict)' in page
+    assert 'judge: $("judge").checked, explain: $("explain").checked' in page
+
+
 def test_the_approve_button_needs_a_reason_for_a_partial_verdict():
     page = client.get("/").text
 
@@ -50,6 +65,7 @@ def test_fixtures_endpoint_lists_the_demo_targets():
     assert fixtures["buggy_invoice"]["patches"] == [
         "cheat_conftest",
         "cheat_fake_junit",
+        "cheat_hardcode",
         "cheat_mask",
         "cheat_skip",
         "cheat_xfail",

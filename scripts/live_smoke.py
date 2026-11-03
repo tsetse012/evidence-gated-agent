@@ -6,12 +6,20 @@ The gate must never need the network, so this is a script you run by hand:
     set -a; . ~/.secrets/credentials.env; set +a
     uv run python scripts/live_smoke.py buggy_invoice
     uv run python scripts/live_smoke.py injected_readme
+    uv run python scripts/live_smoke.py buggy_invoice --author scripted:cheat_hardcode \\
+        --judge --explain
+
+``--author scripted:<patch>`` skips the model author and applies a canned patch,
+so the judge layer can be exercised on a known diff. ``--judge`` asks clef one
+question per changed file; ``--explain`` has a different vendor's model describe
+the finished verdict. Neither can change the verdict.
 
 It writes a normal run under ``runs/<run_id>/`` (trace.jsonl + summary.json) and
 prints the turn count, every tool call with its watch-layer flags, the verifier's
-first line, and the cost computed from the API's own ``usage`` numbers. The API
-key is never printed and never written into the trace; the script checks the
-trace for it before it reports.
+first line, the judge's per-file probabilities, the explanation, and the cost
+computed from the API's own ``usage`` numbers. The API key is never printed and
+never written into the trace; the script checks the run directory for it before
+it reports.
 """
 
 from __future__ import annotations
@@ -35,6 +43,16 @@ def clip(text: str, limit: int = 160) -> str:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("fixture", choices=["buggy_invoice", "injected_readme", "zero_tests"])
+    parser.add_argument(
+        "--author",
+        default="llm",
+        help="'llm' (a model driving the sandbox) or 'scripted:<patch>' (a canned patch)",
+    )
+    parser.add_argument("--judge", action="store_true", help="ask clef one question per changed file")
+    parser.add_argument(
+        "--explain", action="store_true", help="have a different vendor's model describe the verdict"
+    )
+    parser.add_argument("--judge-threshold", type=float, default=None)
     parser.add_argument("--max-turns", type=int, default=20)
     parser.add_argument("--budget-usd", type=float, default=0.20)
     args = parser.parse_args()
@@ -45,18 +63,32 @@ def main() -> int:
         print("run: set -a; . ~/.secrets/credentials.env; set +a", file=sys.stderr)
         return 2
 
-    client = VultrChatClient.from_env()
+    author, patch = "llm", None
+    if args.author.startswith("scripted:"):
+        author, patch = "scripted", args.author.split(":", 1)[1]
+    elif args.author != "llm":
+        print(f"--author must be 'llm' or 'scripted:<patch>'; got {args.author!r}", file=sys.stderr)
+        return 2
+
+    client = VultrChatClient.from_env() if author == "llm" else None
     print(f"fixture: {args.fixture}")
-    print(f"model:   {client.model}  (base {client.base_url})")
-    print(f"limits:  max_turns={args.max_turns} budget=${args.budget_usd:.2f}")
+    print(f"author:  {args.author}")
+    if client is not None:
+        print(f"model:   {client.model}  (base {client.base_url})")
+        print(f"limits:  max_turns={args.max_turns} budget=${args.budget_usd:.2f}")
+    print(f"layers:  judge={'on' if args.judge else 'off'} explain={'on' if args.explain else 'off'}")
     print()
 
     result = pipeline.run_pipeline(
         args.fixture,
-        author="llm",
+        patch,
+        author=author,
         llm_client=client,
         llm_options={"max_turns": args.max_turns, "budget_usd": args.budget_usd},
         run_probes_too=True,
+        judge=args.judge,
+        judge_threshold=args.judge_threshold,
+        explain=args.explain,
     )
 
     trace_path = Path(result["trace_path"])
@@ -121,12 +153,46 @@ def main() -> int:
     print(f"verdict: {verdict['first_line']}")
     print(f"counts:  {verdict['counts']}")
     print(f"findings: {[f['code'] for f in verdict['findings']]}")
+    print()
+
+    # The judge layer: one question per changed file. The probability is printed
+    # as-is — never rounded into a verdict.
+    judge = summary.get("judge")
+    if judge is not None:
+        print(f"judge:   model={judge.get('model')!r} threshold={judge.get('threshold')} "
+              f"status={judge.get('status')}")
+        for item in judge.get("items") or []:
+            probability = item.get("probability")
+            shown = "no answer" if probability is None else f"p={probability:.3f}"
+            signal = "FLAGGED" if item.get("flagged") else "below"
+            error = f" error={item.get('error')}" if item.get("error") else ""
+            print(f"  - {item.get('path')} [{item.get('kind')}] {shown} "
+                  f"(threshold {item.get('threshold')}) -> {signal}{error}")
+        judge_usage = [item.get("usage") or {} for item in judge.get("items") or []]
+        print(f"  judge usage: {judge_usage}")
+        print()
+    elif args.judge:
+        print("judge:   enabled but no report reached the summary")
+        print()
+
+    explanation = summary.get("explanation")
+    if explanation is not None:
+        print(f"explanation ({explanation.get('model')}, does not affect the verdict):")
+        print(f"  {explanation.get('text') or '(none) — ' + str(explanation.get('error'))}")
+        print(f"  usage: {explanation.get('usage')} latency={explanation.get('latency_s')}s")
+        print()
+
     print(f"cost:    ${llm.get('cost_usd', 0.0):.6f} "
           f"(prompt={usage.get('prompt_tokens')} completion={usage.get('completion_tokens')} tokens)")
-    key_in_trace = api_key in trace_path.read_text(encoding="utf-8")
-    print(f"api key in trace: {'YES — LEAK' if key_in_trace else 'no'}")
+    # The key must not be in any file the run wrote — not just the trace.
+    leaked = [
+        path.name
+        for path in trace_path.parent.rglob("*")
+        if path.is_file() and api_key in path.read_text(encoding="utf-8", errors="replace")
+    ]
+    print(f"api key in run dir: {'YES — LEAK in ' + str(leaked) if leaked else 'no'}")
     print(f"summary: {(trace_path.parent / 'summary.json')}")
-    return 1 if key_in_trace else 0
+    return 1 if leaked else 0
 
 if __name__ == "__main__":
     raise SystemExit(main())

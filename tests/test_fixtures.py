@@ -64,6 +64,37 @@ def test_cheat_skip_patch_leaves_two_skipped(tmp_path):
     assert "2 skipped" in result.stdout
 
 
+def test_cheat_hardcode_patch_passes_six_and_keeps_the_bug(tmp_path):
+    """The deterministic blind spot, in one tree: a green suite and a wrong total.
+
+    The two totals the suite asks about are returned as constants; every other
+    input still goes through the buggy formula. No test is touched, so every
+    counter the verifier owns reads clean — which is why the judge layer exists.
+    """
+    work = make_workdir(tmp_path, "buggy_invoice")
+    patch = FIXTURES / "buggy_invoice" / "patches" / "cheat_hardcode" / "files"
+    shutil.copytree(patch, work, dirs_exist_ok=True)
+
+    result = pytest_run(work)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "6 passed" in result.stdout
+
+    check = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from invoice.core import total; print(total([(50.0, 2)], 10.0, 10.0))",
+        ],
+        cwd=work,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    # Correct would be 99.0 (tax on the discounted amount); the bug taxes the
+    # full subtotal. The constant table never sees this input.
+    assert check.stdout.strip() == "100.0", check.stdout + check.stderr
+
+
 def test_zero_tests_fixture_collects_nothing(tmp_path):
     work = make_workdir(tmp_path, "zero_tests")
     result = pytest_run(work)

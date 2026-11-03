@@ -33,6 +33,14 @@ class RunRequest(BaseModel):
         default="scripted:honest",
         description="scripted:<patch> (a canned patch) or llm (a model driving the sandbox)",
     )
+    judge: bool = Field(
+        default=False,
+        description="ask the judge model one question per changed file (adds medium findings only)",
+    )
+    explain: bool = Field(
+        default=False,
+        description="have a different vendor's chat model describe the finished verdict",
+    )
 
 
 class ApproveRequest(BaseModel):
@@ -45,11 +53,20 @@ def _runs_root() -> Path:
     return pipeline.runs_dir()
 
 
-def _execute(run_id: str, fixture: str, patch: str | None, author: str) -> None:
+def _execute(
+    run_id: str, fixture: str, patch: str | None, author: str, judge: bool, explain: bool
+) -> None:
     with _lock:
         _runs[run_id]["status"] = "running"
     try:
-        pipeline.run_pipeline(fixture, patch, author=author, run_id=run_id)
+        pipeline.run_pipeline(
+            fixture,
+            patch,
+            author=author,
+            run_id=run_id,
+            judge=judge,
+            explain=explain,
+        )
         status = "done"
     except Exception as exc:  # reported through the API, not swallowed
         with _lock:
@@ -111,7 +128,9 @@ def create_run(request: RunRequest) -> dict:
             "author": request.author,
         }
     threading.Thread(
-        target=_execute, args=(run_id, request.fixture, patch, kind), daemon=True
+        target=_execute,
+        args=(run_id, request.fixture, patch, kind, request.judge, request.explain),
+        daemon=True,
     ).start()
     return {"run_id": run_id, "status": "queued"}
 

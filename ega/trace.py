@@ -95,6 +95,7 @@ def summarize(trace_path: Path) -> dict:
 
     verify_data = verify_record.get("data", {})
     verdict = verify_data.get("verdict", {})
+    explain_record = by_step.get("explain")
 
     # The watch layer (ega.monitor) rides on each tool.call record: what the
     # agent tried, and what the sandbox did with it. The summary lists only the
@@ -163,6 +164,23 @@ def summarize(trace_path: Path) -> dict:
         "counts": verdict.get("counts"),
         "findings": verdict.get("findings", []),
         "isolation": verdict.get("isolation"),
+        # The judge layer's per-file questions/probabilities, when it ran. Its
+        # findings are already inside `findings` above — this is the signal
+        # record the UI shows beside them.
+        "judge": verdict.get("judge"),
+        # Prose written *after* the verdict was final, by a different vendor's
+        # model. It is shown with its source label and never feeds the verdict.
+        "explanation": (
+            {
+                "model": (explain_record.get("data") or {}).get("model"),
+                "text": explain_record.get("stdout") or "",
+                "error": (explain_record.get("data") or {}).get("error"),
+                "usage": (explain_record.get("data") or {}).get("usage") or {},
+                "latency_s": (explain_record.get("data") or {}).get("latency_s"),
+            }
+            if explain_record is not None
+            else None
+        ),
         "probes": (probes_record.get("data", {}) or {}).get("results", []),
         "approved": approve_record is not None,
         "approved_at": approve_record["ts"] if approve_record else None,

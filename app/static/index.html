@@ -62,6 +62,12 @@
     <select id="fixture"></select>
     <label class="muted" for="patch">author</label>
     <select id="patch"></select>
+    <label class="muted" title="one judge-model question per changed file; adds findings, never removes one">
+      <input type="checkbox" id="judge" /> judge (clef)
+    </label>
+    <label class="muted" title="a different vendor's model describes the finished verdict; it cannot change it">
+      <input type="checkbox" id="explain" /> explain (glm-5.3)
+    </label>
     <button id="run" class="primary">Run</button>
     <span id="status-line" class="muted"></span>
   </div>
@@ -82,6 +88,16 @@
   <section>
     <h2>False-green findings</h2>
     <div id="findings" class="muted">none</div>
+  </section>
+
+  <section>
+    <h2>Judge model signal (adds findings — it cannot remove any)</h2>
+    <div id="judge" class="muted">judge layer is off for this run</div>
+  </section>
+
+  <section>
+    <h2 id="explain-title">Explanation (does not affect the verdict)</h2>
+    <div id="explain" class="muted">no explanation for this run</div>
   </section>
 
   <section>
@@ -144,7 +160,8 @@ async function startRun() {
   currentSummary = null;
   $("approve-reason").value = "";
   updateApproveState();
-  const body = { fixture: $("fixture").value, author: $("patch").value };
+  const body = { fixture: $("fixture").value, author: $("patch").value,
+                 judge: $("judge").checked, explain: $("explain").checked };
   const res = await fetch("/api/runs", {
     method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
   });
@@ -202,6 +219,41 @@ function render(data) {
         <td>${esc(f.message)}</td>
         <td class="evidence">${esc(f.evidence)}</td></tr>`).join("") + `</table>`
     : (v.exit_token ? `<span class="done">no findings</span>` : `<span class="muted">none yet</span>`);
+
+  // The judge layer: one question per changed file. Its findings are already in
+  // the findings table above; this panel shows the signal behind them, including
+  // the questions it could not answer (an unanswered question is never a "no").
+  const j = v.judge;
+  $("judge").className = "";
+  if (!j) {
+    $("judge").innerHTML = `<span class="muted">judge layer is off for this run — the verdict rests on deterministic checks only</span>`;
+  } else {
+    const head = `<div class="muted">model <strong>${esc(j.model || "none")}</strong> · threshold ${esc(j.threshold)} · status <strong>${esc(j.status)}</strong> — it can only add findings; it cannot remove one or raise the verdict</div>`;
+    const rows = (j.items || []).map((it) => `<tr>
+        <td class="mono">${esc(it.path)}</td>
+        <td>${esc(it.kind)}</td>
+        <td class="evidence">${esc(it.question)}</td>
+        <td>${it.probability === null || it.probability === undefined ? `<span class="warn">no answer</span>` : `<strong>${Number(it.probability).toFixed(3)}</strong>`}</td>
+        <td>${esc(it.threshold)}</td>
+        <td>${it.error ? `<span class="bad">${esc(it.error)}</span>` : (it.flagged ? `<span class="badge high">flagged</span>` : `<span class="badge blocked">below</span>`)}</td></tr>`).join("");
+    const table = rows
+      ? `<table><tr><th>file</th><th>kind</th><th>question</th><th>p(noul)</th><th>threshold</th><th>signal</th></tr>${rows}</table>`
+      : `<div class="muted">no changed file needed a judge question</div>`;
+    $("judge").innerHTML = head + table;
+  }
+
+  // The explanation is prose about a finished verdict, written by a different
+  // vendor's model. The header names the model and says it does not decide.
+  const e = s.explanation;
+  if (e) {
+    $("explain-title").textContent = `Explanation (${e.model || "no model"}, does not affect the verdict)`;
+    $("explain").innerHTML = e.text
+      ? `<div>${esc(e.text)}</div><div class="muted">generated after the verdict was final; the verdict above is unchanged by it</div>`
+      : `<span class="warn">no explanation — ${esc(e.error || "unknown error")}</span>`;
+  } else {
+    $("explain-title").textContent = "Explanation (does not affect the verdict)";
+    $("explain").innerHTML = `<span class="muted">explanation is off for this run</span>`;
+  }
 
   // The watch layer: what the agent *tried*, paired with what the sandbox did
   // with it. An attempt is not a policy decision — the sandbox is the blocker —

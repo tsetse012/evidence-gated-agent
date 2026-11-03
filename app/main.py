@@ -5,6 +5,7 @@ No build step: one static HTML page talks to the JSON API.
 
 from __future__ import annotations
 
+import os
 import threading
 from pathlib import Path
 
@@ -28,7 +29,10 @@ _lock = threading.Lock()
 
 class RunRequest(BaseModel):
     fixture: str
-    author: str = Field(default="scripted:honest", description="scripted:<patch>")
+    author: str = Field(
+        default="scripted:honest",
+        description="scripted:<patch> (a canned patch) or llm (a model driving the sandbox)",
+    )
 
 
 class ApproveRequest(BaseModel):
@@ -41,11 +45,11 @@ def _runs_root() -> Path:
     return pipeline.runs_dir()
 
 
-def _execute(run_id: str, fixture: str, patch: str) -> None:
+def _execute(run_id: str, fixture: str, patch: str | None, author: str) -> None:
     with _lock:
         _runs[run_id]["status"] = "running"
     try:
-        pipeline.run_pipeline(fixture, patch, run_id=run_id)
+        pipeline.run_pipeline(fixture, patch, author=author, run_id=run_id)
         status = "done"
     except Exception as exc:  # reported through the API, not swallowed
         with _lock:
@@ -55,13 +59,20 @@ def _execute(run_id: str, fixture: str, patch: str) -> None:
         _runs[run_id]["status"] = status
 
 
-def _parse_author(author: str) -> str:
-    if not author.startswith("scripted:"):
-        raise HTTPException(
-            status_code=400,
-            detail=f"only scripted authors exist in this phase; got {author!r}",
-        )
-    return author.split(":", 1)[1]
+def _parse_author(author: str) -> tuple[str, str | None]:
+    """``scripted:<patch>`` -> a canned patch; ``llm`` -> a model in the sandbox."""
+    if author == "llm":
+        return "llm", None
+    if author.startswith("scripted:"):
+        return "scripted", author.split(":", 1)[1]
+    raise HTTPException(
+        status_code=400,
+        detail=f"author must be 'scripted:<patch>' or 'llm'; got {author!r}",
+    )
+
+
+def llm_available() -> bool:
+    return bool(os.environ.get("VULTR_INFERENCE_API_KEY"))
 
 
 @app.get("/")
@@ -80,11 +91,16 @@ def create_run(request: RunRequest) -> dict:
         meta = pipeline.fixture_meta(request.fixture)
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
-    patch = _parse_author(request.author)
-    if patch not in meta["patches"]:
+    kind, patch = _parse_author(request.author)
+    if kind == "scripted" and patch not in meta["patches"]:
         raise HTTPException(
             status_code=400,
             detail=f"unknown patch {patch!r} for {request.fixture!r}; have {meta['patches']}",
+        )
+    if kind == "llm" and not llm_available():
+        raise HTTPException(
+            status_code=503,
+            detail="the llm author needs VULTR_INFERENCE_API_KEY in the server environment",
         )
     run_id = pipeline.new_run_id()
     with _lock:
@@ -95,7 +111,7 @@ def create_run(request: RunRequest) -> dict:
             "author": request.author,
         }
     threading.Thread(
-        target=_execute, args=(run_id, request.fixture, patch), daemon=True
+        target=_execute, args=(run_id, request.fixture, patch, kind), daemon=True
     ).start()
     return {"run_id": run_id, "status": "queued"}
 

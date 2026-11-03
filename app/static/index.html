@@ -85,6 +85,11 @@
   </section>
 
   <section>
+    <h2>Agent attempts (watch layer)</h2>
+    <div id="attempts" class="muted">no attempted egress or secret read in this run</div>
+  </section>
+
+  <section>
     <h2>Containment probes</h2>
     <div id="probes" class="muted">not run yet</div>
   </section>
@@ -126,7 +131,11 @@ async function loadFixtures() {
 
 function renderPatches() {
   const f = fixtures.find((x) => x.name === $("fixture").value);
-  $("patch").innerHTML = (f ? f.patches : []).map((p) => `<option value="${esc(p)}">scripted:${esc(p)}</option>`).join("");
+  const patches = f ? f.patches : [];
+  // scripted patches first (they cost nothing), the real model last.
+  $("patch").innerHTML =
+    patches.map((p) => `<option value="scripted:${esc(p)}">scripted:${esc(p)}</option>`).join("") +
+    `<option value="llm">llm — Vultr deepseek-v4.1-flash (sandboxed tools)</option>`;
 }
 
 async function startRun() {
@@ -135,7 +144,7 @@ async function startRun() {
   currentSummary = null;
   $("approve-reason").value = "";
   updateApproveState();
-  const body = { fixture: $("fixture").value, author: "scripted:" + $("patch").value };
+  const body = { fixture: $("fixture").value, author: $("patch").value };
   const res = await fetch("/api/runs", {
     method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
   });
@@ -179,6 +188,7 @@ function render(data) {
          <tr><th>isolation</th><td>${esc(v.isolation)}</td></tr>
          <tr><th>duration</th><td>${esc(v.duration_s)}s</td></tr>
          <tr><th>command</th><td class="mono">${esc(v.test_command)}</td></tr>
+         ${s.llm ? `<tr><th>llm</th><td>${esc(s.llm.model)} · ${esc(s.llm.calls)} calls · ${esc(s.llm.tool_calls)} tool calls · $${Number(s.llm.cost_usd || 0).toFixed(4)}${s.llm.budget_usd ? ` of $${Number(s.llm.budget_usd).toFixed(2)} cap` : ""}</td></tr>` : ""}
        </table>`
     : `<span class="muted">waiting for the verifier…</span>`;
 
@@ -192,6 +202,26 @@ function render(data) {
         <td>${esc(f.message)}</td>
         <td class="evidence">${esc(f.evidence)}</td></tr>`).join("") + `</table>`
     : (v.exit_token ? `<span class="done">no findings</span>` : `<span class="muted">none yet</span>`);
+
+  // The watch layer: what the agent *tried*, paired with what the sandbox did
+  // with it. An attempt is not a policy decision — the sandbox is the blocker —
+  // so the row shows both halves: "attempted X" and the failure that followed.
+  const attempts = s.attempts || [];
+  $("attempts").className = "";
+  $("attempts").innerHTML = attempts.length
+    ? `<table><tr><th>#</th><th>tool</th><th>attempted</th><th>matched</th><th>sandbox evidence</th></tr>` +
+      attempts.map((a) => {
+        const kinds = [a.attempted_egress ? "egress" : "", a.attempted_secret_read ? "secret read" : ""]
+          .filter(Boolean).join(" + ");
+        const matches = [...((a.matches || {}).egress || []), ...((a.matches || {}).secret_read || [])];
+        return `<tr>
+          <td class="muted">${esc(a.seq)}</td>
+          <td class="mono">${esc(a.tool)}</td>
+          <td><span class="badge high">${esc(kinds)}</span></td>
+          <td class="evidence">${esc(matches.join(" · "))}</td>
+          <td class="evidence"><code>${esc(a.evidence)}</code></td></tr>`;
+      }).join("") + `</table>`
+    : `<span class="muted">no attempted egress or secret read in this run</span>`;
 
   const probes = s.probes || [];
   $("probes").className = "";

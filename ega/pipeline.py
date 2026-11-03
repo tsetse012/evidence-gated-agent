@@ -64,23 +64,50 @@ def new_run_id() -> str:
 def _count_files(root: Path) -> int:
     return sum(1 for p in root.rglob("*") if p.is_file())
 
+def build_llm_author(trace: Trace, client=None, options: dict | None = None):
+    """The LLM author, with the model client injectable.
+
+    ``client=None`` builds the real Vultr client from the environment; the tests
+    pass a fake that replays tool calls, so the gate never needs the network.
+    """
+    from .llm_author import LLMAuthor, VultrChatClient
+
+    if client is None:
+        client = VultrChatClient.from_env()
+    return LLMAuthor(client, trace=trace, **(options or {}))
+
 
 def run_pipeline(
     fixture: str,
-    patch: str,
+    patch: str | None = None,
     *,
+    author: str = "scripted",
+    llm_client=None,
+    llm_options: dict | None = None,
     run_id: str | None = None,
     runs_root: Path | None = None,
     limits: Limits | None = None,
     probe_limits: Limits | None = None,
     run_probes_too: bool = True,
 ) -> dict:
-    """Author -> snapshot -> fresh verifier -> containment probes."""
+    """Author -> snapshot -> fresh verifier -> containment probes.
+
+    ``author`` is ``"scripted"`` (a canned patch, needs ``patch``) or ``"llm"``
+    (a chat model driving three sandboxed tools; ``llm_client`` is the seam the
+    tests fake, so the suite never needs the network).
+    """
     meta = fixture_meta(fixture)
-    if patch not in meta["patches"]:
-        raise FileNotFoundError(
-            f"unknown patch {patch!r} for fixture {fixture!r} (have {meta['patches']})"
-        )
+    if author == "scripted":
+        if patch is None:
+            raise ValueError(f"the scripted author needs a patch for fixture {fixture!r}")
+        if patch not in meta["patches"]:
+            raise FileNotFoundError(
+                f"unknown patch {patch!r} for fixture {fixture!r} (have {meta['patches']})"
+            )
+    elif author == "llm":
+        patch = None
+    else:
+        raise ValueError(f"unknown author kind {author!r} (use 'scripted' or 'llm')")
 
     run_id = run_id or new_run_id()
     run_dir = Path(runs_root or runs_dir()) / run_id
@@ -98,11 +125,14 @@ def run_pipeline(
             data={"files": _count_files(author_dir), "run_dir": str(run_dir)},
         )
 
-        author = ScriptedAuthor(fixture_dir=fixture_dir, patch_name=patch)
-        claim: Claim = author.work(task, author_dir)
+        if author == "llm":
+            author_impl = build_llm_author(trace, llm_client, llm_options)
+        else:
+            author_impl = ScriptedAuthor(fixture_dir=fixture_dir, patch_name=patch)
+        claim: Claim = author_impl.work(task, author_dir)
         trace.append(
             "author.work",
-            inputs={"task": task, "author": author.name},
+            inputs={"task": task, "author": author_impl.name},
             data={"claim": claim.as_dict(), "workdir": str(author_dir)},
         )
 
@@ -195,6 +225,7 @@ def run_pipeline(
         return {
             "run_id": run_id,
             "status": "ok",
+            "author": author_impl.name,
             "trace_path": str(trace_path),
             "verdict": verdict.as_dict(),
             "claim": claim.as_dict(),

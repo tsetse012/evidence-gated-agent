@@ -96,6 +96,53 @@ def summarize(trace_path: Path) -> dict:
     verify_data = verify_record.get("data", {})
     verdict = verify_data.get("verdict", {})
 
+    # The watch layer (ega.monitor) rides on each tool.call record: what the
+    # agent tried, and what the sandbox did with it. The summary lists only the
+    # flagged attempts — an honest run derives an empty list, not a "nothing
+    # happened" sentence.
+    llm_calls = [r for r in records if r.get("step") == "llm.call"]
+    tool_calls = [r for r in records if r.get("step") == "tool.call"]
+    setup_data = (by_step.get("author.setup", {}) or {}).get("data", {}) or {}
+
+    attempts = []
+    for record in tool_calls:
+        data = record.get("data") or {}
+        flags = data.get("monitor") or {}
+        if not (flags.get("attempted_egress") or flags.get("attempted_secret_read")):
+            continue
+        attempts.append(
+            {
+                "seq": record.get("seq"),
+                "turn": data.get("turn"),
+                "tool": data.get("tool") or (record.get("inputs") or {}).get("tool"),
+                "attempted_egress": bool(flags.get("attempted_egress")),
+                "attempted_secret_read": bool(flags.get("attempted_secret_read")),
+                "matches": flags.get("matches") or {},
+                "evidence": data.get("blocked_evidence") or "",
+                "exit_code": record.get("exit_code"),
+            }
+        )
+
+    llm = None
+    if llm_calls or tool_calls:
+        usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        cost = 0.0
+        for record in llm_calls:
+            data = record.get("data") or {}
+            call_usage = data.get("usage") or {}
+            for key in usage:
+                usage[key] += int(call_usage.get(key) or 0)
+            cost += float(data.get("cost_usd") or 0.0)
+        llm = {
+            "model": setup_data.get("model")
+            or ((llm_calls[0].get("inputs") or {}).get("model") if llm_calls else None),
+            "calls": len(llm_calls),
+            "tool_calls": len(tool_calls),
+            "usage": usage,
+            "cost_usd": round(cost, 6),
+            "budget_usd": setup_data.get("budget_usd"),
+        }
+
     return {
         "run_id": records[0]["run_id"] if records else trace_path.parent.name,
         "status": (end.get("data", {}) or {}).get("status", "running"),
@@ -119,6 +166,8 @@ def summarize(trace_path: Path) -> dict:
         "probes": (probes_record.get("data", {}) or {}).get("results", []),
         "approved": approve_record is not None,
         "approved_at": approve_record["ts"] if approve_record else None,
+        "attempts": attempts,
+        "llm": llm,
         "step_count": len(records),
         "duration_s": round(
             sum(step.get("data", {}).get("duration_s", 0.0) for step in records), 3

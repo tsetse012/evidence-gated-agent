@@ -550,6 +550,10 @@ class LLMAuthor:
         self.prompt_price = prompt_price
         self.completion_price = completion_price
         self.model = getattr(client, "model", "unknown")
+        # Flagged tool calls, as the harness classified them before they ran.
+        # The verifier reads this list (never the author's own words) so that
+        # an attempt keeps a passing run from going straight to approval.
+        self.attempts: list[dict] = []
         self.external = bool(getattr(client, "external", False))
         self.endpoint_host = str(getattr(client, "endpoint_host", "") or "")
 
@@ -690,7 +694,7 @@ class LLMAuthor:
                         + f"…[truncated {len(content) - TRACE_ARG_LIMIT} chars]"
                     )
                     traced_arguments["content_truncated"] = True
-                self._append(
+                record = self._append(
                     "tool.call",
                     status="ok" if outcome.error is None else "error",
                     inputs={"turn": turns, "tool": call.name, "arguments": traced_arguments},
@@ -717,6 +721,16 @@ class LLMAuthor:
                         },
                     },
                 )
+                if attempt.flagged:
+                    self.attempts.append(
+                        {
+                            "seq": record.get("seq") if record else None,
+                            "tool": call.name,
+                            "arguments": traced_arguments,
+                            "monitor": attempt.as_dict(),
+                            "blocked_evidence": outcome.evidence(),
+                        }
+                    )
                 messages.append(
                     {
                         "role": "tool",

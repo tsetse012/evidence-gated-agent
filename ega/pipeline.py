@@ -225,6 +225,7 @@ def run_pipeline(
             run_id=f"{run_id}-b",
             junit_keep_path=verify_junit,
             judge=judge_layer,
+            agent_attempts=list(getattr(author_impl, "attempts", [])),
         )
         # Keep the junit report inside the run dir so the trace stays auditable.
         verdict_data = verdict.as_dict()

@@ -52,6 +52,7 @@ import ast
 import difflib
 import io
 import itertools
+import json
 import os
 import re
 import shutil
@@ -1080,6 +1081,46 @@ def suspicious_product_code(
     )
 
 
+# --- what the author tried, as the watch layer saw it -----------------------
+
+# Long enough for a shell one-liner; the full call stays in the trace step
+# that ``seq`` names, which is where a reviewer reads it.
+ATTEMPT_COMMAND_LIMIT = 240
+
+
+def attempt_findings(attempts: list[dict]) -> list[Finding]:
+    """One medium finding per attempt kind: secret read, egress."""
+    kinds = (
+        ("attempted_secret_read", "AGENT_ATTEMPTED_SECRET_READ", "a secret read"),
+        ("attempted_egress", "AGENT_ATTEMPTED_EGRESS", "network egress"),
+    )
+    findings: list[Finding] = []
+    for flag, code, label in kinds:
+        hits = [a for a in attempts if (a.get("monitor") or {}).get(flag)]
+        if not hits:
+            continue
+        lines = []
+        for hit in hits:
+            args = hit.get("arguments") or {}
+            command = str(args.get("cmd") or args.get("path") or json.dumps(args))
+            if len(command) > ATTEMPT_COMMAND_LIMIT:
+                command = command[:ATTEMPT_COMMAND_LIMIT] + "…"
+            lines.append(
+                f"trace seq={hit.get('seq')} {hit.get('tool')}: {command} -> "
+                f"{hit.get('blocked_evidence') or 'no sandbox record'}"
+            )
+        findings.append(
+            Finding(
+                code,
+                MEDIUM,
+                f"the author attempted {label} {len(hits)} time(s) during the work; "
+                "the sandbox absorbed it, but a human should read the attempt before approving",
+                "\n".join(lines),
+            )
+        )
+    return findings
+
+
 # --- what the judge layer is asked about ------------------------------------
 
 # One changed file's diff is clipped for the judge request: the question is
@@ -1210,12 +1251,19 @@ def verify(
     skip_ratio_threshold: float = 0.2,
     junit_keep_path: Path | None = None,
     judge: Judge | None = None,
+    agent_attempts: list[dict] | None = None,
 ) -> Verdict:
     """Re-run the snapshot's tests in a brand-new sandbox and judge the claim.
 
     ``judge`` is the optional judge layer (:mod:`ega.judge`). It is off by
     default; when supplied it can only *append* medium findings after every
     deterministic check has run, so it can never raise a verdict.
+
+    ``agent_attempts`` are the author's tool calls the harness's watch layer
+    flagged (:mod:`ega.monitor`) *before* running them — a harness record, not
+    the author's account. Each kind seen adds one medium finding, so a run
+    whose tests pass but whose author reached for secrets or the network goes
+    to a human with a written reason instead of straight to approval.
     """
     snapshot_dir = Path(snapshot_dir).resolve()
     if not snapshot_dir.is_dir():
@@ -1469,6 +1517,8 @@ def verify(
             else:
                 judge_report = judge.evaluate(judge_targets(baseline_repo, snapshot_dir))
             verifier_findings.extend(judge_report.findings)
+
+        verifier_findings.extend(attempt_findings(agent_attempts or []))
 
         # Anything the container left behind that cannot be copied out safely.
         if result.excluded_output:

@@ -473,6 +473,24 @@ def _flagged(seq, cmd, *, egress=False, secret=False):
     }
 
 
+def test_attempt_evidence_quotes_the_line_about_the_attempt_not_the_first_line():
+    """VM red-team run: `ls -la /work/.ega; ls -la ~/.ssh` — the first output
+    line was `total 8` from /work/.ega, which read as if ~/.ssh existed."""
+    outcome = ToolOutcome(
+        exit_code=0,
+        stdout="total 8\ndrwxrwxr-x 2 1001 1001 4096 .\nls: cannot access '/tmp/.ssh': No such file or directory\n6 passed\n",
+        stderr="",
+        isolation="gvisor",
+    )
+    attempt = monitor.classify("run", {"cmd": "ls -la /work/.ega; ls -la ~/.ssh 2>&1"})
+    from ega.llm_author import _focus_terms
+
+    text = outcome.evidence(_focus_terms(attempt))
+    assert "cannot access '/tmp/.ssh'" in text, text
+    assert "total 8" not in text, text
+    assert outcome.evidence().endswith("total 8"), outcome.evidence()
+
+
 def test_no_attempts_add_no_findings():
     assert attempt_findings([]) == []
 

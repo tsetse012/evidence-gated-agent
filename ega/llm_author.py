@@ -363,8 +363,13 @@ class ToolOutcome:
     error: str | None = None
     excluded_output: tuple[str, ...] = ()
 
-    def evidence(self) -> str:
-        """One line of "what the sandbox did with it" for the attempt record."""
+    def evidence(self, focus: tuple[str, ...] = ()) -> str:
+        """One line of "what the sandbox did with it" for the attempt record.
+
+        ``focus`` holds what the watch layer matched (``.ssh``, ``curl``…). A
+        chained command prints several things; the line that answers the
+        attempt is the one that mentions it, not whichever came first.
+        """
         if self.error:
             return f"error: {self.error}"
         parts = [f"exit={self.exit_code}", f"isolation={self.isolation or 'n/a'}"]
@@ -374,9 +379,13 @@ class ToolOutcome:
             parts.append("OOM-killed")
         if self.excluded_output:
             parts.append(f"excluded: {', '.join(self.excluded_output[:3])}")
-        text = (self.stderr.strip() or self.stdout.strip()).splitlines()
-        if text:
-            parts.append(text[0][:300])
+        lines = [
+            line for line in (self.stderr + "\n" + self.stdout).splitlines() if line.strip()
+        ]
+        terms = [term.lower() for term in focus if term]
+        relevant = [line for line in lines if any(term in line.lower() for term in terms)]
+        for line in (relevant[:2] or lines[:1]):
+            parts.append(line.strip()[:300])
         return "; ".join(parts)
 
     def as_dict(self) -> dict:
@@ -435,6 +444,10 @@ class SandboxToolRunner:
             error=result.error,
             excluded_output=tuple(result.excluded_output),
         )
+
+def _focus_terms(attempt: monitor.Attempt) -> tuple[str, ...]:
+    """The matched text of each watch-layer hit ("ssh-dir: .ssh" -> ".ssh")."""
+    return tuple(hit.split(": ", 1)[-1] for hit in attempt.egress + attempt.secret_read)
 
 # --- the author -------------------------------------------------------------
 
@@ -709,7 +722,9 @@ class LLMAuthor:
                         "started_at": _now(),
                         "finished_at": _now(),
                         "duration_s": round(tool_finished - tool_started, 3),
-                        "blocked_evidence": outcome.evidence() if attempt.flagged else None,
+                        "blocked_evidence": (
+                            outcome.evidence(_focus_terms(attempt)) if attempt.flagged else None
+                        ),
                         "stdout_truncated": out_cut,
                         "stderr_truncated": err_cut,
                         "sandbox": {
@@ -728,7 +743,7 @@ class LLMAuthor:
                             "tool": call.name,
                             "arguments": traced_arguments,
                             "monitor": attempt.as_dict(),
-                            "blocked_evidence": outcome.evidence(),
+                            "blocked_evidence": outcome.evidence(_focus_terms(attempt)),
                         }
                     )
                 messages.append(

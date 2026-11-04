@@ -45,6 +45,10 @@ def test_the_judge_and_explanation_panels_are_labelled_as_non_decisive():
     assert "it can only add findings; it cannot remove one or raise the verdict" in page
     assert 'Explanation (${e.model || "no model"}, does not affect the verdict)' in page
     assert 'judge: $("judge").checked, explain: $("explain").checked' in page
+    # the result panels must not share an id with the checkboxes, or getElementById
+    # returns the checkbox and the panel never shows the judge or the explanation
+    for element_id in ("judge", "explain", "judge-panel", "explain-panel"):
+        assert page.count(f'id="{element_id}"') == 1, element_id
 
 
 def test_the_approve_button_needs_a_reason_for_a_partial_verdict():

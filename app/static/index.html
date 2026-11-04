@@ -92,12 +92,12 @@
 
   <section>
     <h2>Judge model signal (adds findings — it cannot remove any)</h2>
-    <div id="judge" class="muted">judge layer is off for this run</div>
+    <div id="judge-panel" class="muted">judge layer is off for this run</div>
   </section>
 
   <section>
     <h2 id="explain-title">Explanation (does not affect the verdict)</h2>
-    <div id="explain" class="muted">no explanation for this run</div>
+    <div id="explain-panel" class="muted">no explanation for this run</div>
   </section>
 
   <section>
@@ -225,9 +225,9 @@ function render(data) {
   // the findings table above; this panel shows the signal behind them, including
   // the questions it could not answer (an unanswered question is never a "no").
   const j = v.judge;
-  $("judge").className = "";
+  $("judge-panel").className = "";
   if (!j) {
-    $("judge").innerHTML = `<span class="muted">judge layer is off for this run — the verdict rests on deterministic checks only</span>`;
+    $("judge-panel").innerHTML = `<span class="muted">judge layer is off for this run — the verdict rests on deterministic checks only</span>`;
   } else {
     const head = `<div class="muted">model <strong>${esc(j.model || "none")}</strong> · threshold ${esc(j.threshold)} · status <strong>${esc(j.status)}</strong> — it can only add findings; it cannot remove one or raise the verdict</div>`;
     const rows = (j.items || []).map((it) => `<tr>
@@ -240,7 +240,7 @@ function render(data) {
     const table = rows
       ? `<table><tr><th>file</th><th>kind</th><th>question</th><th>p(noul)</th><th>threshold</th><th>signal</th></tr>${rows}</table>`
       : `<div class="muted">no changed file needed a judge question</div>`;
-    $("judge").innerHTML = head + table;
+    $("judge-panel").innerHTML = head + table;
   }
 
   // The explanation is prose about a finished verdict, written by a different
@@ -248,12 +248,12 @@ function render(data) {
   const e = s.explanation;
   if (e) {
     $("explain-title").textContent = `Explanation (${e.model || "no model"}, does not affect the verdict)`;
-    $("explain").innerHTML = e.text
+    $("explain-panel").innerHTML = e.text
       ? `<div>${esc(e.text)}</div><div class="muted">generated after the verdict was final; the verdict above is unchanged by it</div>`
       : `<span class="warn">no explanation — ${esc(e.error || "unknown error")}</span>`;
   } else {
     $("explain-title").textContent = "Explanation (does not affect the verdict)";
-    $("explain").innerHTML = `<span class="muted">explanation is off for this run</span>`;
+    $("explain-panel").innerHTML = `<span class="muted">explanation is off for this run</span>`;
   }
 
   // The watch layer: what the agent *tried*, paired with what the sandbox did

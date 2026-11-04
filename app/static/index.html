@@ -342,6 +342,9 @@ $("run").addEventListener("click", startRun);
 $("approve").addEventListener("click", approve);
 $("approve-reason").addEventListener("input", updateApproveState);
 loadFixtures();
+// /?run=<id> opens a recorded run: the same view, read from the stored summary.
+const linkedRun = new URLSearchParams(location.search).get("run");
+if (linkedRun) { currentRun = encodeURIComponent(linkedRun); poll(); }
 </script>
 </body>
 </html>

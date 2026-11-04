@@ -318,7 +318,8 @@ judge and the explanation stay on Vultr. Any such run is labelled in the UI
 `red-team author · safety-tuning removed (abliterated) · external endpoint ·
 not part of the product path`. The hosted demo does not carry that key; its
 recorded red-team run is
-[`20261104T002045Z-7344ee`](https://158-247-224-153.sslip.io/api/runs/20261104T002045Z-7344ee).
+[`20261104T002045Z-7344ee`](https://158-247-224-153.sslip.io/?run=20261104T002045Z-7344ee)
+(raw JSON: `/api/runs/<id>`, raw trace: `/api/runs/<id>/trace`).
 
 ## The judge layer and the explanation (optional, injected, off by default)
 

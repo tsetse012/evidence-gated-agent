@@ -361,6 +361,10 @@ async function openLinkedRun(id) {
       const v = author.startsWith("llm") ? "llm" : author;
       if ([...$("patch").options].some((o) => o.value === v)) $("patch").value = v;
     }
+    const run = await (await fetch(`/api/runs/${currentRun}`)).json();
+    const s = run.summary || {};
+    $("judge").checked = Boolean(s.judge);
+    $("explain").checked = Boolean(s.explanation);
   } catch (e) { /* the view still renders from the summary */ }
   poll();
 }

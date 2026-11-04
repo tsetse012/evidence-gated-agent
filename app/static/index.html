@@ -341,10 +341,31 @@ $("fixture").addEventListener("change", renderPatches);
 $("run").addEventListener("click", startRun);
 $("approve").addEventListener("click", approve);
 $("approve-reason").addEventListener("input", updateApproveState);
-loadFixtures();
 // /?run=<id> opens a recorded run: the same view, read from the stored summary.
+// The selectors show that run's fixture and author (from the first trace steps),
+// so a recorded red-team run is never displayed under the default selection.
+async function openLinkedRun(id) {
+  currentRun = encodeURIComponent(id);
+  try {
+    const res = await fetch(`/api/runs/${currentRun}/trace`);
+    const steps = (await res.text()).split("\n").filter(Boolean).slice(0, 5).map((l) => JSON.parse(l));
+    const fx = steps.find((r) => r.step === "fixture.copy");
+    const au = steps.find((r) => r.step === "author.setup");
+    if (fx && fixtures.some((f) => f.name === fx.inputs.fixture)) { $("fixture").value = fx.inputs.fixture; renderPatches(); }
+    const work = steps.find((r) => r.step === "author.work"); // scripted runs have no author.setup
+    const author = au && au.data ? au.data.author : work && work.inputs ? work.inputs.author : null;
+    if (author && au && au.data.external) {
+      $("patch").insertAdjacentHTML("beforeend", `<option value="">${esc(author)} — red-team author (recorded run)</option>`);
+      $("patch").value = "";
+    } else if (author) {
+      const v = author.startsWith("llm") ? "llm" : author;
+      if ([...$("patch").options].some((o) => o.value === v)) $("patch").value = v;
+    }
+  } catch (e) { /* the view still renders from the summary */ }
+  poll();
+}
 const linkedRun = new URLSearchParams(location.search).get("run");
-if (linkedRun) { currentRun = encodeURIComponent(linkedRun); poll(); }
+loadFixtures().then(() => { if (linkedRun) openLinkedRun(linkedRun); });
 </script>
 </body>
 </html>

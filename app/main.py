@@ -6,7 +6,9 @@ No build step: one static HTML page talks to the JSON API.
 from __future__ import annotations
 
 import os
+import re
 import threading
+from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
@@ -25,6 +27,22 @@ app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 # In-memory run registry: id -> {status, error, fixture, author, run_dir}
 _runs: dict[str, dict] = {}
 _lock = threading.Lock()
+
+# The demo is public, so every run costs containers and every model run costs
+# credit. Both are capped by the server, not by the page.
+MAX_ACTIVE_RUNS = int(os.environ.get("EGA_MAX_ACTIVE_RUNS", "2"))
+DAILY_MODEL_RUNS = int(os.environ.get("EGA_DAILY_MODEL_RUNS", "40"))
+_model_runs_by_day: dict[str, int] = {}
+
+# Letters, digits, "_" and "-" only: no ".", no "/", so a run id can never
+# climb out of the runs directory. (pipeline.new_run_id() is 20261104T012345Z-1a2b3c.)
+RUN_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+
+
+def _checked_run_id(run_id: str) -> str:
+    if not RUN_ID_PATTERN.fullmatch(run_id):
+        raise HTTPException(status_code=404, detail=f"unknown run: {run_id}")
+    return run_id
 
 
 class RunRequest(BaseModel):
@@ -119,8 +137,25 @@ def create_run(request: RunRequest) -> dict:
             status_code=503,
             detail="the llm author needs VULTR_INFERENCE_API_KEY in the server environment",
         )
+    uses_model = kind == "llm" or request.judge or request.explain
     run_id = pipeline.new_run_id()
     with _lock:
+        active = sum(1 for r in _runs.values() if r["status"] in ("queued", "running"))
+        if active >= MAX_ACTIVE_RUNS:
+            raise HTTPException(
+                status_code=429,
+                detail=f"{active} run(s) already in progress; try again when one finishes",
+            )
+        if uses_model:
+            day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            used = _model_runs_by_day.get(day, 0)
+            if used >= DAILY_MODEL_RUNS:
+                raise HTTPException(
+                    status_code=429,
+                    detail=f"today's model-run allowance ({DAILY_MODEL_RUNS}) is used up; "
+                    "scripted runs without the judge still work",
+                )
+            _model_runs_by_day[day] = used + 1
         _runs[run_id] = {
             "status": "queued",
             "error": None,
@@ -137,6 +172,7 @@ def create_run(request: RunRequest) -> dict:
 
 @app.get("/api/runs/{run_id}")
 def get_run(run_id: str) -> dict:
+    run_id = _checked_run_id(run_id)
     with _lock:
         state = dict(_runs.get(run_id) or {})
     run_dir = _runs_root() / run_id
@@ -157,6 +193,7 @@ def get_run(run_id: str) -> dict:
 
 @app.get("/api/runs/{run_id}/trace", response_class=PlainTextResponse)
 def get_trace(run_id: str) -> PlainTextResponse:
+    run_id = _checked_run_id(run_id)
     trace_path = _runs_root() / run_id / "trace.jsonl"
     if not trace_path.is_file():
         raise HTTPException(status_code=404, detail=f"no trace for run {run_id}")
@@ -165,6 +202,7 @@ def get_trace(run_id: str) -> PlainTextResponse:
 
 @app.post("/api/runs/{run_id}/approve")
 def approve_run(run_id: str, request: ApproveRequest | None = None) -> dict:
+    run_id = _checked_run_id(run_id)
     try:
         summary = pipeline.approve(run_id, reason=(request.reason if request else ""))
     except FileNotFoundError as exc:

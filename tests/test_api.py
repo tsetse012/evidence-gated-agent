@@ -110,6 +110,40 @@ def test_unknown_run_is_404():
     assert client.post("/api/runs/does-not-exist/approve").status_code == 404
 
 
+def test_a_run_id_that_is_not_one_never_reaches_a_path():
+    for bad in ("..", "%2e%2e", "20261104T012345Z-1a2b3c.json", ".hidden", "x" * 65):
+        assert client.get(f"/api/runs/{bad}").status_code == 404, bad
+        assert client.get(f"/api/runs/{bad}/trace").status_code == 404, bad
+        assert client.post(f"/api/runs/{bad}/approve").status_code == 404, bad
+
+
+def test_the_public_demo_caps_runs_in_flight(monkeypatch):
+    import app.main as main
+
+    busy = {f"20261104T00000{i}Z-00000{i}": {"status": "running"} for i in range(2)}
+    monkeypatch.setattr(main, "_runs", busy)
+    monkeypatch.setattr(main, "MAX_ACTIVE_RUNS", 2)
+    response = client.post("/api/runs", json={"fixture": "buggy_invoice", "author": "scripted:honest"})
+    assert response.status_code == 429
+    assert "in progress" in response.json()["detail"]
+
+
+def test_the_public_demo_caps_model_runs_per_day(monkeypatch):
+    import app.main as main
+    from datetime import datetime, timezone
+
+    day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    monkeypatch.setattr(main, "_runs", {})
+    monkeypatch.setattr(main, "DAILY_MODEL_RUNS", 3)
+    monkeypatch.setattr(main, "_model_runs_by_day", {day: 3})
+    response = client.post(
+        "/api/runs",
+        json={"fixture": "buggy_invoice", "author": "scripted:honest", "judge": True},
+    )
+    assert response.status_code == 429
+    assert "allowance" in response.json()["detail"]
+
+
 @pytest.mark.docker
 def test_run_endpoint_reaches_a_verdict():
     created = client.post(

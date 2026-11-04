@@ -48,6 +48,9 @@ write_files:
       WorkingDirectory=/opt/evidence-gated-agent
       Environment=EGA_RUNS_DIR=/var/lib/ega/runs
       Environment=EGA_RUNTIME=runsc
+      # Model keys live here (root:ega 0640), never in this unit or the repo.
+      # The sandbox never sees them: it forwards only BASE_CONTAINER_ENV.
+      EnvironmentFile=-/etc/ega/ega.env
       ExecStart=/opt/evidence-gated-agent/.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000
       Restart=always
       RestartSec=3
